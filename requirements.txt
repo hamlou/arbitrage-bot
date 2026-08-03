@@ -1,0 +1,17 @@
+# NOTE: Polymarket cut over to CLOB V2 on 2026-04-28. The V1 `py-clob-client` package
+# no longer works against production (https://clob.polymarket.com) — no backward
+# compatibility, verified against docs.polymarket.com/v2-migration. Use the V2 package.
+py-clob-client-v2>=0.1
+httpx>=0.27
+websockets>=12.0
+python-dotenv>=1.0
+pydantic>=2.6
+pydantic-settings>=2.2
+rich>=13.7
+python-telegram-bot>=21.0
+tenacity>=8.2
+aiosqlite>=0.19
+web3>=6.20
+ntplib>=1.0.3
+pytest>=8.0
+pytest-asyncio>=0.23

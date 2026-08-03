@@ -1,0 +1,26 @@
+[
+  {
+    "id": "12345",
+    "question": "Bitcoin Up or Down - 15 min - 14:00 ET",
+    "clobTokenIds": ["tok_yes_btc_1", "tok_no_btc_1"],
+    "liquidity": "125000.50",
+    "endDate": "2026-07-31T14:00:00Z",
+    "closed": false
+  },
+  {
+    "id": "12346",
+    "question": "Ethereum Up or Down - 5 min - 14:05 ET",
+    "clobTokenIds": ["tok_yes_eth_1", "tok_no_eth_1"],
+    "liquidity": "9000.00",
+    "endDate": "2026-07-31T14:05:00Z",
+    "closed": false
+  },
+  {
+    "id": "12347",
+    "question": "Will it rain in NYC tomorrow?",
+    "clobTokenIds": ["tok_yes_rain", "tok_no_rain"],
+    "liquidity": "500000.00",
+    "endDate": "2026-08-01T00:00:00Z",
+    "closed": false
+  }
+]

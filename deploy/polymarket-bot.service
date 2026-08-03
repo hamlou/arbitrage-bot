@@ -1,0 +1,55 @@
+# systemd unit for the Polymarket arbitrage bot.
+#
+# Deploy (edit the /opt/polymarket-arb-bot paths below first if the repo
+# lives elsewhere, then):
+#
+#   sudo cp deploy/polymarket-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polymarket-bot
+#
+# Watch it:  journalctl -u polymarket-bot -f
+# Status:    systemctl status polymarket-bot
+
+[Unit]
+Description=Polymarket arbitrage bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Repo root, so main.py picks up .env and storage/ exactly as when run by
+# hand from the checkout. ExecStopPost commands inherit this too.
+WorkingDirectory=/opt/polymarket-arb-bot
+
+ExecStart=/opt/polymarket-arb-bot/.venv/bin/python main.py
+
+# Restart on crash (any non-zero exit), NOT on a clean exit 0 — main.py turns
+# a manual `systemctl stop` (SIGTERM) into an orderly shutdown, so a clean
+# stop must not auto-restart.
+Restart=on-failure
+
+# Backoff between restarts. systemd has no native exponential backoff, so the
+# floor is RestartSec=10 and the ceiling is the StartLimit pair: after 5
+# crashes in 300s systemd stops restarting (unit enters failed state) instead
+# of hammering the Binance/Coinbase/Polymarket APIs once a second forever.
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Crash alert: runs right AFTER the process dies and BEFORE systemd restarts
+# it. systemd exposes how the process stopped to ExecStopPost via
+# $SERVICE_RESULT/$EXIT_CODE/$EXIT_STATUS; the hook alerts on Telegram only
+# when the exit was abnormal (see deploy/send_crash_alert.py). A clean stop
+# stays silent.
+ExecStopPost=/opt/polymarket-arb-bot/.venv/bin/python /opt/polymarket-arb-bot/deploy/send_crash_alert.py
+
+# Optional: run as a dedicated non-root user instead of root. If you set
+# this, make sure that user can read/write the repo and its .env.
+# User=polymarket
+
+# Unbuffered Python output so journalctl shows logs as they happen.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

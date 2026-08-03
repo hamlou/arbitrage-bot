@@ -1,0 +1,15 @@
+{
+  "event_type": "book",
+  "asset_id": "tok_yes_btc_1",
+  "market": "0xabc123",
+  "bids": [
+    {"price": "0.54", "size": "1200"},
+    {"price": "0.53", "size": "3000"}
+  ],
+  "asks": [
+    {"price": "0.56", "size": "800"},
+    {"price": "0.57", "size": "2500"}
+  ],
+  "timestamp": "1700000000000",
+  "hash": "0xdeadbeef"
+}
