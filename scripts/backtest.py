@@ -109,6 +109,7 @@ from engine.fair_value import (  # noqa: E402
     RealizedVolatilityEstimator,
     fair_value_probability,
 )
+from engine.fees import taker_fee_fraction_of_notional  # noqa: E402
 from engine.signal import (  # noqa: E402
     MIN_TICKS_FOR_VOLATILITY,
     MOMENTUM_LOOKBACK_S,
@@ -426,7 +427,9 @@ async def _simulate_trades(
         except ValueError:
             continue  # insufficient book depth — same failure mode as the paper broker
         avg_price = _round_to_tick(avg_price, tick_size)
-        fee_usd = size_usd * fee_pct
+        # Price-dependent taker fee (rate * (1 - p) of notional) — the same
+        # schedule the paper broker now applies.
+        fee_usd = size_usd * taker_fee_fraction_of_notional(avg_price, fee_pct)
         if size_usd + fee_usd > balance:
             continue
         balance -= size_usd + fee_usd

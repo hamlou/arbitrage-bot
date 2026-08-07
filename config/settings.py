@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     # round-trip exit: entries are now short convergence bets (exit-on-reprice
     # banks the repricing, which usually overshoots the entry edge), so the
     # entry bar no longer needs to fund a hold-to-settlement outcome bet.
-    # Net-of-fee threshold: raw edge must clear TAKER_FEE_PCT (2%) on top.
+    # Net-of-fee threshold: raw edge must clear the price-dependent round-trip
+    # fee (engine/fees.py) on top — ~7% of notional at p=0.5, less at higher
+    # entry prices.
     EDGE_THRESHOLD_PCT: float = 0.04
     # Confidence is mean(freshness, depth/2000, consistency) — the consistency
     # term is always 1 on the fair-value path, so this gate's real job is to
@@ -70,10 +72,16 @@ class Settings(BaseSettings):
     # (the latter can mathematically never profit after fees) and lost ~$170
     # on two of those entries. 0.80 is deliberately conservative.
     MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.80
-    # Taker fee used to make the edge gate fee-aware (matches
-    # broker_paper.DEFAULT_FEE_PCT). A raw edge that doesn't clear the
-    # round-trip fee isn't an edge.
-    TAKER_FEE_PCT: float = 0.02
+    # Polymarket's crypto taker fee RATE (docs.polymarket.com/trading/fees) —
+    # NOT a flat fraction. The per-share fee is fee_rate * p * (1 - p); as a
+    # fraction of what you spend that is fee_rate * (1 - p) per side (~3.5%
+    # of notional at p=0.50, ~1.5% at p=0.78, larger at low prices). A taker
+    # round trip pays it twice, so at p~0.5 the fee hurdle is ~7% of notional
+    # before spread. All fee math lives in engine/fees.py; this setting is
+    # the single source of truth for the RATE. Changed 2026-08-07: was a flat
+    # 2% assumption that UNDERSTATED mid-price fees — paper results looked
+    # better than live would be.
+    TAKER_FEE_PCT: float = 0.07
     # Cross-exchange sanity gate: before firing a signal, the latest known
     # Binance and Coinbase prices for the asset must agree within this many
     # percent (0.1 = 0.1%). A bigger divergence usually means one feed is
@@ -140,23 +148,23 @@ class Settings(BaseSettings):
     # lag entry into an EV-negative outcome bet (EV = p*win - (1-p)*stake
     # with p~0.52 and a 2% fee each way). Two knobs:
     #   REPRICE_EXIT_GAIN_PCT: exit when the held token has gained this
-    #     fraction from entry. Break-even is NOT just the fees — it is the
-    #     whole round trip through the SPREAD: we bought at the ask (~1-2c
-    #     above mid on these books) and sell at the bid, so a ~1c spread on
-    #     a ~0.50 token is ~4% plus ~4.1% of fees. A real net profit needs
-    #     roughly an 8%+ token gain, which is why this is set at 7% (the
-    #     first rung where exits bank a small net profit, ~+2% of size) and
-    #     the protocol is tuned for the BIG reprices — the article's example
-    #     reprice is 20+ points on the token (a 0.6% BTC move shifts a
-    #     15-min window's probability by 20+ points), so actual exits land
-    #     well above the threshold. Deliberately checked BEFORE TAKE_PROFIT:
-    #     a position that would settle +60% exits at the reprice threshold
-    #     instead — the round-trip caps winners on purpose, trading cadence
-    #     and win rate for the occasional big hold.
+    #     fraction from entry. Break-even is the WHOLE round trip: the real
+    #     price-dependent taker fee (~3.5% of notional per side at p=0.5, so
+    #     ~7% round trip) PLUS the bid-ask spread we cross twice (~1-2c on a
+    #     ~0.50 book = ~2-4%). A ~10% token gain therefore nets roughly +2-3%
+    #     of size at mid prices after fees+spread, and the BIG reprices — the
+    #     article's example is a 20+ point token move (a 0.6% BTC shift moves
+    #     a 15-min window's probability by 20+ points) — bank 10-25%+. The
+    #     marginal 3-5% divergences are fee-food, exactly why Polymarket's
+    #     fee rollout (March 2026) compressed the strategy for small takers.
+    #     Deliberately checked BEFORE TAKE_PROFIT: a position that would
+    #     settle +60% exits at the reprice threshold instead — the round-trip
+    #     caps winners on purpose, trading cadence and win rate for the
+    #     occasional big hold.
     #   REPRICE_EXIT_MAX_HOLD_S: if the market hasn't repriced within this
     #     window, the arbitrage is gone — stop waiting and let the normal
     #     exits (TAKE_PROFIT / EDGE_REVERSAL / settlement) take over.
-    REPRICE_EXIT_GAIN_PCT: float = 0.07
+    REPRICE_EXIT_GAIN_PCT: float = 0.10
     REPRICE_EXIT_MAX_HOLD_S: float = 240.0
 
     # --- Sum-to-one (combo) arbitrage -----------------------------------------

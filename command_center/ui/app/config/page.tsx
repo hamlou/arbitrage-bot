@@ -70,7 +70,7 @@ const HUMAN: Record<string, string> = {
   MAX_DIRECTIONAL_ENTRY_PRICE: "Max entry price",
   EDGE_THRESHOLD_PCT: "Min edge to fire",
   MIN_CONFIDENCE: "Min confidence",
-  TAKER_FEE_PCT: "Taker fee (fee-aware gate)",
+  TAKER_FEE_PCT: "Taker fee rate (price-dependent)",
   CROSS_EXCHANGE_TOLERANCE_PCT: "Binance↔Coinbase tolerance",
   MIN_MARKET_LIQUIDITY_USD: "Min market liquidity",
   SIMULATED_FILL_LATENCY_S: "Simulated fill latency",

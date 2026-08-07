@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from data.polymarket_feed import Market, OrderBook
+from engine.fees import taker_fee_pct
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +46,11 @@ def find_sum_to_one_opportunity(
         return None
 
     profit_before_fees = 1.0 - combined_cost
-    # Fees are charged on both legs (buying YES and buying NO), each roughly
-    # proportional to that leg's cost.
-    fee_cost = fee_pct * combined_cost
+    # Price-dependent taker fees (fee_rate * p * (1 - p) per share), charged
+    # on both legs. fee_pct here is the RATE (see engine/fees.py) — the old
+    # flat-fraction fee overstated extreme-price legs and understated
+    # mid-price legs.
+    fee_cost = taker_fee_pct(yes_ask, fee_pct) + taker_fee_pct(no_ask, fee_pct)
     net_profit_pct = (profit_before_fees - fee_cost) / combined_cost
 
     if net_profit_pct <= min_edge_pct:

@@ -14,12 +14,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed
+from engine import fees
+from engine.fees import DEFAULT_TAKER_FEE_RATE
 from engine.sum_to_one import SumToOneOpportunity
 from storage.db import Database
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FEE_PCT = 0.02  # Polymarket's taker fee schedule changes over time — keep this config-driven.
+# Polymarket's crypto taker fee RATE (docs.polymarket.com/trading/fees) —
+# applied as fee_rate * p * (1 - p) per share, NOT as a flat fraction of
+# size (see engine/fees.py). Override per-instance for tests.
+DEFAULT_FEE_PCT = DEFAULT_TAKER_FEE_RATE
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +306,11 @@ class PaperBroker:
 
         avg_price, shares = self._walk_book_for_fill(book, size_usd)
         avg_price = _round_to_tick(avg_price, self.tick_size)
-        fee_usd = size_usd * self.fee_pct
+        # Price-dependent taker fee. Polymarket's formula is per SHARE
+        # (rate * p * (1 - p)); as a fraction of what we SPEND that is
+        # rate * (1 - p) — ~3.5% of notional at p=0.50, less at higher
+        # prices. The old flat fee_pct assumption understated mid-price fees.
+        fee_usd = size_usd * fees.taker_fee_fraction_of_notional(avg_price, self.fee_pct)
 
         total_cost = size_usd + fee_usd
         if total_cost > self.balance_usd:
@@ -370,14 +379,17 @@ class PaperBroker:
         combo_group_id = str(uuid.uuid4())
         half = total_size_usd / 2
 
-        # Pre-check the TOTAL cost (both legs + fees) BEFORE opening either
-        # leg. Two reasons (reviewed 2026-08-07): (1) with concurrent legs,
-        # two per-leg balance checks could each pass while the combined cost
-        # exceeds the balance — the total must be validated up front;
-        # (2) sequentially, the second leg could raise InsufficientBalanceError
-        # after the first already opened, leaving a HALF-OPEN hedge that the
-        # edge-revalidation below never sees.
-        total_cost = total_size_usd * (1 + self.fee_pct)
+        # Pre-check the TOTAL cost (both legs + price-dependent fees) BEFORE
+        # opening either leg. Two reasons (reviewed 2026-08-07): (1) with
+        # concurrent legs, two per-leg balance checks could each pass while
+        # the combined cost exceeds the balance — the total must be validated
+        # up front; (2) sequentially, the second leg could raise
+        # InsufficientBalanceError after the first already opened, leaving a
+        # HALF-OPEN hedge that the edge-revalidation below never sees. Each
+        # leg is half the size, so total fee = half*(fee(yes_ask) + fee(no_ask)).
+        fee_yes = half * fees.taker_fee_fraction_of_notional(opportunity.yes_ask, self.fee_pct)
+        fee_no = half * fees.taker_fee_fraction_of_notional(opportunity.no_ask, self.fee_pct)
+        total_cost = total_size_usd + fee_yes + fee_no
         if total_cost > self.balance_usd:
             raise InsufficientBalanceError(
                 f"Sum-to-one combo cost incl. fees ${total_cost:.2f} exceeds "
@@ -438,7 +450,11 @@ class PaperBroker:
         # 2026-08-07: fills landed at 0.31+0.73=1.04 and 0.17+0.89=1.06 (a
         # guaranteed loss), yet the decision-time edge check had passed.
         combined_cost = yes_fill.avg_price + no_fill.avg_price
-        fee_cost = self.fee_pct * combined_cost
+        # Price-dependent fees per share: fee_rate * p * (1 - p) for each leg.
+        fee_cost = (
+            fees.taker_fee_pct(yes_fill.avg_price, self.fee_pct)
+            + fees.taker_fee_pct(no_fill.avg_price, self.fee_pct)
+        )
         locked_edge_pct = (1.0 - combined_cost) - fee_cost
         if locked_edge_pct <= 0:
             # The "arbitrage" is gone — reverse both legs immediately at the
@@ -514,7 +530,9 @@ class PaperBroker:
             return None
 
         proceeds = filled_shares * exit_price
-        exit_fee = proceeds * self.fee_pct
+        # Exit is a taker sell — the same price-dependent fee applies (fraction
+        # of the proceeds, rate * (1 - p) at the exit price).
+        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(exit_price, self.fee_pct)
         net_proceeds = proceeds - exit_fee
         realized_pnl = net_proceeds - trade["size_usd"] - trade["fee_usd"]
 

@@ -233,12 +233,13 @@ async def test_sum_to_one_prechecks_total_cost_no_half_open_hedge(db):
              "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
     feed = FakeFeed(books)
     market = make_market()
-    # Total cost = 100 * 1.02 = $102; balance $101 covers one leg's $51 but
-    # not both — each leg alone would pass its own per-leg check.
-    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=101, fee_pct=0.02)
+    # Total cost = $100 + price-dependent fees (0.07 rate): at the 0.46/0.48
+    # asks that is ~$1.74 -> $101.74 total; balance $101 covers one leg's
+    # $51 but not both — each leg alone would pass its own per-leg check.
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=101, fee_pct=0.07)
 
     opp = find_sum_to_one_opportunity(
-        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.02,
+        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.07,
     )
     assert opp is not None
 

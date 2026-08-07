@@ -33,6 +33,7 @@ from data.binance_feed import PriceUpdate
 from data.polymarket_feed import Market, OrderBook
 from engine.calibration import CalibrationModel
 from engine.fair_value import FairValueInputs, RealizedVolatilityEstimator, fair_value_probability
+from engine.fees import round_trip_fee_pct
 from storage.db import Database
 
 logger = logging.getLogger(__name__)
@@ -453,10 +454,16 @@ class SignalEngine:
             target_side = ""
             edge_pct = 0.0
         else:
-            # Fee-aware edge: the raw model-vs-market gap must clear the taker
-            # fee on entry (the round-trip also pays an exit fee at early exit;
-            # settlement is free). Otherwise the "edge" is consumed by fees.
-            net_edge = edge_pct - self.settings.TAKER_FEE_PCT
+            # Fee-aware edge (price-dependent, per docs.polymarket.com/trading/
+            # fees): Polymarket's crypto taker fee is fee_rate * p * (1-p) per
+            # share — ~3.5% of notional per side at p=0.50, so ~7% for a taker
+            # round trip. The raw model-vs-market gap must clear that or the
+            # "edge" is consumed by fees (settlement is free — no exit fee at
+            # resolution). The flat-2% assumption this replaced UNDERSTATED
+            # mid-price fees, making paper results look better than live.
+            entry_price = target_book.best_ask if target_book.best_ask is not None else polymarket_prob
+            fee = round_trip_fee_pct(entry_price, fee_rate=self.settings.TAKER_FEE_PCT)
+            net_edge = edge_pct - fee
             # Price sanity: buying a token above MAX_DIRECTIONAL_ENTRY_PRICE
             # means break-even requires being right 80%+ of the time — no
             # model on a 5-minute window deserves that. Reject rather than

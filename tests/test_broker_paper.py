@@ -80,14 +80,20 @@ async def test_place_order_rejects_insufficient_balance(db):
 
 
 async def test_place_order_deducts_fee_from_balance(db):
+    """The fee is Polymarket's price-dependent schedule (rate * (1 - p) of
+    notional, i.e. rate * p * (1 - p) per share), NOT a flat 2% — at the
+    blended ~0.569 fill price that's ~0.86% of size with fee_rate=0.02."""
+    from engine.fees import taker_fee_fraction_of_notional
+
     feed = FakeFeed(make_book())
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.02)
     market = make_market()
 
-    await broker.place_order(market, "YES", size_usd=100)
+    fill = await broker.place_order(market, "YES", size_usd=100)
 
-    # $100 size + 2% fee ($2) = $102 deducted
-    assert broker.balance_usd == pytest.approx(1000 - 102)
+    expected_fee = 100 * taker_fee_fraction_of_notional(fill.avg_price, fee_rate=0.02)
+    assert broker.balance_usd == pytest.approx(1000 - 100 - expected_fee)
+    assert expected_fee < 2.0  # sanity: well under the old flat 2% at this price
 
 
 async def test_place_order_persists_fill_realism_metrics(db):
