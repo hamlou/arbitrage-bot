@@ -68,6 +68,10 @@ class PaperBroker:
         self.feed = feed
         self.fee_pct = fee_pct
         self.balance_usd = starting_balance_usd
+        # The ledger reconstruction in load_open_positions() must always start
+        # from the SAME baseline, or a second call double-counts (it mutated
+        # self.balance_usd on the first pass). Capture it once here.
+        self._starting_balance_usd = starting_balance_usd
         self.simulated_fill_latency_s = simulated_fill_latency_s
         self.min_order_size_usd = min_order_size_usd
         self.tick_size = tick_size
@@ -92,15 +96,41 @@ class PaperBroker:
         still open from a previous run is invisible to settle_position() and
         get_equity(), since PaperBroker previously tracked open positions
         ONLY in memory and never reloaded them. Returns the count restored.
+
+        Also restores the CASH BALANCE from the TRADE LEDGER. Balance is
+        otherwise an in-memory float that resets to the starting balance on
+        every restart, so a restart with open positions silently re-counted
+        money that was already spent (the equity curve jumped UP ~$43 on a
+        real 2026-08-06 restart). The equity curve is NOT used to restore:
+        it was itself written by corrupted in-memory balances, so it carries
+        the same bug forward. The ledger is the truth:
+
+            balance = starting_balance
+                      + sum(realized_pnl of CLOSED trades)   # payout - size - fee
+                      - sum(size + fee of OPEN trades)        # already spent at entry
         """
         open_trades = await self.db.get_open_trades(mode=self.mode)
         self._open_positions.clear()
         for t in open_trades:
             self._open_positions.setdefault(t["market_id"], []).append(t["id"])
+
+        # Reconstruct cash from the trade ledger.
+        try:
+            all_trades = await self.db.get_all_trades(mode=self.mode)
+            restored_balance = self._starting_balance_usd  # fixed baseline, idempotent
+            for t in all_trades:
+                if t.get("status") == "CLOSED":
+                    restored_balance += float(t.get("realized_pnl_usd") or 0.0)
+                else:
+                    restored_balance -= float(t.get("size_usd") or 0.0) + float(t.get("fee_usd") or 0.0)
+            self.balance_usd = restored_balance
+        except Exception:
+            logger.exception("Could not reconstruct paper balance from ledger; keeping in-memory value")
+
         if open_trades:
             logger.info(
-                "Restored %d open paper position(s) across %d market(s) from DB",
-                len(open_trades), len(self._open_positions),
+                "Restored %d open paper position(s) across %d market(s) from DB, balance $%.2f",
+                len(open_trades), len(self._open_positions), self.balance_usd,
             )
         return len(open_trades)
 
@@ -201,6 +231,7 @@ class PaperBroker:
         size_usd: float,
         strategy: str = "latency_arb",
         combo_group_id: Optional[str] = None,
+        book_source: Optional[object] = None,
     ) -> Fill:
         """
         side: "YES" or "NO". Walks the real live order book for the
@@ -224,12 +255,24 @@ class PaperBroker:
 
         token_id = market.token_id_yes if side == "YES" else market.token_id_no
 
-        book_at_decision = await self.feed.get_order_book(market.market_id, token_id)
+        async def _current_book() -> OrderBook:
+            # book_source lets the event-driven fast path fill against the
+            # continuously-updated WS book cache instead of a REST round trip
+            # (which would add ~100-300ms back into the arbitrage window). When
+            # provided, fall back to the normal REST fetch only if the cache
+            # has no book for this token yet.
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        book_at_decision = await _current_book()
         mid_before = book_at_decision.mid
 
         if self.simulated_fill_latency_s > 0:
             await asyncio.sleep(self.simulated_fill_latency_s)
-            book = await self.feed.get_order_book(market.market_id, token_id)
+            book = await _current_book()
         else:
             book = book_at_decision
 
@@ -277,6 +320,7 @@ class PaperBroker:
 
     async def place_sum_to_one_order(
         self, opportunity: SumToOneOpportunity, total_size_usd: float,
+        book_source: Optional[object] = None,
     ) -> tuple[Fill, Fill]:
         """
         Buys both YES and NO to lock in a risk-free profit regardless of
@@ -296,9 +340,11 @@ class PaperBroker:
         half = total_size_usd / 2
         yes_fill = await self.place_order(
             opportunity.market, "YES", half, strategy="sum_to_one", combo_group_id=combo_group_id,
+            book_source=book_source,
         )
         no_fill = await self.place_order(
             opportunity.market, "NO", half, strategy="sum_to_one", combo_group_id=combo_group_id,
+            book_source=book_source,
         )
         return yes_fill, no_fill
 

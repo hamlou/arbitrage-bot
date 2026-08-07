@@ -142,6 +142,169 @@ async def test_no_side_signal_uses_no_book_for_depth_not_yes_book(db):
         assert signal.confidence > 0.1
 
 
+# -- entry-price discipline guardrails (2026-08-06 fixes) ---------------------
+# NOTE: these use the FAIR-VALUE path (reference price far from spot so the
+# z-score saturates) because the momentum fallback's implied prob stays close
+# to 0.5 for modest moves and would target the cheap side, not the rich one.
+
+
+def feed_fair_value_ticks(engine: SignalEngine) -> None:
+    """Noisy ticks around ~66000 with reference far below (60000) so the
+    fair-value z-score saturates toward 1.0 and the model targets YES."""
+    prices = [66000, 66010, 65995, 66005, 66000, 66015, 65998, 66008, 66002, 66012]
+    feed_ticks(engine, prices)
+
+
+async def test_blocks_entry_when_ask_above_max_directional_entry_price(db):
+    """
+    Regression guard: the bot bought YES @ 0.82 and NO @ 0.99 on overconfident
+    model reads and lost ~$170 on two trades. Buying a token above
+    MAX_DIRECTIONAL_ENTRY_PRICE means break-even requires being right 80%+ of
+    the time after fees — the signal must not fire.
+    """
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.80, TAKER_FEE_PCT=0.02,
+    )
+    engine = SignalEngine(settings, db)
+
+    feed_fair_value_ticks(engine)
+    market = make_market(reference_price=60000, expires_at_ts=time.time() + 300)
+    # Model leans YES (implied ~0.98), but the YES ask at 0.85 is above the cap.
+    yes_book = make_book("tok_yes", 0.83, 0.85)
+    no_book = make_book("tok_no", 0.13, 0.15)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.side == "YES"
+    assert signal.fired is False
+    assert "max" in signal.reason  # blocked specifically by the price cap
+
+
+async def test_allows_entry_when_ask_below_max_directional_entry_price(db):
+    """A reasonable ask with a non-degenerate model read must still be allowed
+    to fire — the cap and the saturation guard are guardrails, not a kill
+    switch. Uses the momentum fallback (no reference price) so the read stays
+    inside the sane band."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.80, TAKER_FEE_PCT=0.02,
+    )
+    engine = SignalEngine(settings, db)
+
+    # Moderate confirmed upward momentum -> implied ~0.66, not saturated.
+    feed_ticks(engine, [100, 101, 102])
+    market = make_market(reference_price=None)
+    yes_book = make_book("tok_yes", 0.48, 0.50)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.model_used == "momentum_fallback"
+    assert signal.fired is True
+
+
+async def test_edge_gate_is_fee_aware(db):
+    """The raw model-vs-market gap must clear the taker fee before it counts as
+    an edge — otherwise the "edge" is entirely consumed by fees. Uses a
+    non-degenerate momentum read with aligned direction so only the fee gate
+    can be the blocker."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.04,  # high fee on purpose
+    )
+    engine = SignalEngine(settings, db)
+
+    # Downward move -> implied ~0.45, model targets NO (aligned with the
+    # momentum so the fresh-move gate passes). Market mid 0.49 -> raw edge
+    # ~0.04; minus 0.04 fee leaves ~0 net < 0.05 threshold -> must not fire.
+    feed_ticks(engine, [100.6, 100.3, 100.0])
+    market = make_market(reference_price=None)
+    yes_book = make_book("tok_yes", 0.48, 0.50)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.fired is False
+    assert "net edge" in signal.reason
+
+
+# -- fresh-move / time-remaining entry gates (2026-08-07 fixes) --------------
+# The bot bought NO @ 0.69 (implied NO 0.86) while BTC was actually RISING and
+# Polymarket held YES at 0.30-0.33 — a 25s drift from a stale reference price,
+# not a lag. The position hit ~$0 in 5s (-$35). The strategy's premise is
+# "Polymarket LAGS a fresh Binance move", so the model direction must agree
+# with actual recent price momentum, and entries must not happen in the final
+# stretch of a window.
+
+
+async def test_blocks_when_momentum_opposes_model_direction(db):
+    """The model leans YES (price far above a low reference) but the recent
+    price is actually FALLING. There is no fresh move in the model's
+    direction — the market is repricing against the model, so this is a
+    disagreement, not a lag. Must not fire."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+    )
+    engine = SignalEngine(settings, db)
+
+    # Falling hard: 66000 -> 64200 over 10s. Model (reference 60000) says YES
+    # with huge confidence, but the price is moving DOWN against it.
+    prices = [66000, 65800, 65600, 65400, 65200, 65000, 64800, 64600, 64400, 64200]
+    feed_ticks(engine, prices)
+    market = make_market(reference_price=60000, expires_at_ts=time.time() + 300)
+    yes_book = make_book("tok_yes", 0.48, 0.50)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.side == "YES"  # the model still leans YES
+    assert signal.fired is False
+    assert "no fresh aligned move" in signal.reason
+
+
+async def test_blocks_entry_when_window_almost_over(db):
+    """Even with a genuine aligned move, entering in the final seconds of a
+    window is a noise trade — the market has effectively decided. Must not
+    fire."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+    )
+    engine = SignalEngine(settings, db)
+
+    # Genuine upward momentum, market priced 0.48/0.50 — everything about the
+    # signal is fine except there are only 30 seconds left.
+    feed_ticks(engine, [100, 100.5, 101, 101.5, 102])
+    market = make_market(reference_price=None, expires_at_ts=time.time() + 30)
+    yes_book = make_book("tok_yes", 0.48, 0.50)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.fired is False
+    assert "left" in signal.reason and "minimum" in signal.reason
+
+
+async def test_implied_probability_clamped_and_blocks_saturated_read(db):
+    """The fair-value model saturates to ~0.0 / ~1.0 on 5-minute windows
+    (verified live: implied=0.99999998 vs market 0.085). A degenerate read
+    must be clamped AND must not fire even after clamping — otherwise a
+    saturated read (e.g. the real YES @ 0.45, -$88.43 loss) still clears the
+    edge threshold on its clamped value."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+    )
+    engine = SignalEngine(settings, db)
+
+    feed_fair_value_ticks(engine)
+    market = make_market(reference_price=60000, expires_at_ts=time.time() + 30)
+    yes_book = make_book("tok_yes", 0.60, 0.62)
+    no_book = make_book("tok_no", 0.36, 0.38)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert 0.02 <= signal.implied_prob <= 0.98  # clamped
+    assert signal.fired is False  # saturated read is not tradable
+    assert "saturated" in signal.reason
+
+
 # -- exit-check recompute without logging -----------------------------------
 
 async def test_log_false_does_not_write_to_signals_table(db):

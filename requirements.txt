@@ -12,6 +12,11 @@ python-telegram-bot>=21.0
 tenacity>=8.2
 aiosqlite>=0.19
 web3>=6.20
-ntplib>=1.0.3
+numpy>=1.26
+ntplib>=0.4.0
 pytest>=8.0
 pytest-asyncio>=0.23
+
+# Command Center API (command_center/api/main.py)
+fastapi>=0.115
+uvicorn>=0.34

@@ -19,14 +19,19 @@ def _write_price_csv(
     dt: float = 1.0,
     start: float = 1_700_000_000.0,
     seed: int = 42,
+    drift: float = 0.0,
 ) -> None:
-    """Deterministic 1-second-spaced BTC series with small noise."""
+    """Deterministic 1-second-spaced BTC series with small noise. A positive
+    `drift` gives the series a real directional move (the live strategy's
+    fresh-move gate requires aligned recent momentum before firing — a pure
+    random walk with ~0.05% 15s moves sits below that threshold and would
+    honestly produce no trades)."""
     rng = random.Random(seed)
     price = 65_000.0
     rows = []
     for i in range(n):
         rows.append((start + i * dt, price))
-        price *= 1 + 0.0005 * (rng.random() - 0.5)
+        price *= 1 + drift + 0.0005 * (rng.random() - 0.5)
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["timestamp", "price"])
@@ -107,7 +112,10 @@ def test_calls_real_fair_value_function(tmp_path, monkeypatch, capsys):
 
 def test_orderbook_mode_simulates_fills_via_real_broker_walk(tmp_path, monkeypatch, capsys):
     price_csv = tmp_path / "btc_1s.csv"
-    _write_price_csv(price_csv, n=1100)  # ~18 min of 1s data -> span long enough for 3 periods
+    # Upward drift so the live fresh-move gate (aligned momentum required to
+    # fire) passes deterministically at every decision point — the model leans
+    # YES against a book at YES 0.03/0.04, and the drift aligns with that.
+    _write_price_csv(price_csv, n=1100, drift=0.0003)  # ~18 min of 1s data
     timestamps, _ = backtest.load_price_csv(price_csv)  # reuse the real loader
 
     # Real-format order-book snapshots for one contract window in EACH THIRD of

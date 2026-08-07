@@ -186,6 +186,16 @@ class SignalEngine:
         tracker = self._trackers.get(f"{asset}USDT")
         return tracker.latest.price if tracker and tracker.latest else None
 
+    def latest_tick_received_at(self, asset: str) -> Optional[float]:
+        """Wall-clock time the most recent Binance tick for an asset was
+        received, or None if none has arrived yet. main.py uses this as the
+        latency cycle's true start time — without it, measured "tick->order"
+        latency only covered the time inside one poll cycle and hid the up-to-
+        1s poll wait that actually decides whether the arbitrage window is
+        winnable."""
+        tracker = self._trackers.get(f"{asset}USDT")
+        return tracker.latest.received_at if tracker and tracker.latest else None
+
     def _momentum_implied_probability(self, momentum: float, direction: str, duration_minutes: int) -> float:
         model = self._calibration.get(duration_minutes)
         if model is not None:
@@ -350,12 +360,77 @@ class SignalEngine:
                 await self._log(sig, tick_age)
             return sig
 
+        # Clamp the model's implied probability into a sane band. Verified
+        # 2026-08-06: the fair-value model routinely saturated to ~0.0 / ~1.0
+        # (implied=0.99999998 against a market reading 0.085), and the bot
+        # bought YES @ 0.82 / NO @ 0.99 on those overconfident reads, losing
+        # ~$170 on two trades. A model that says "99.999998%" is not a signal
+        # — it's a degenerate input, and an edge computed from it is fiction.
+        #
+        # A read that HITS the clamp boundary is by definition untrustworthy
+        # (the clamp exists because these values are degenerate), so such a
+        # signal must NOT fire even after clamping — clamping alone shrinks
+        # the edge but 0.98 - 0.45 = 0.53 would still clear the threshold and
+        # trade a degenerate read at a rich price (the real YES @ 0.45,
+        # -$88.43 loss). If the raw value was outside the band, the model is
+        # saturated and there is no reliable edge to act on.
+        IMPLIED_PROB_MIN, IMPLIED_PROB_MAX = 0.02, 0.98
+        model_saturated = implied_prob < IMPLIED_PROB_MIN or implied_prob > IMPLIED_PROB_MAX
+        implied_prob = max(IMPLIED_PROB_MIN, min(IMPLIED_PROB_MAX, implied_prob))
+
         edge_pct = abs(implied_prob - polymarket_prob)
         target_side = "YES" if implied_prob > polymarket_prob else "NO"
         target_book = yes_book if target_side == "YES" else no_book
         # We always BUY the target side's token, so depth on that token's own
         # ask side is what matters — not a proxy inferred from the other book.
         depth_usd = target_book.depth_usd("ask")
+
+        # -- Fresh-move gate: only trade a REAL lag, never a drift --
+        # The strategy's premise is "Polymarket LAGS a fresh Binance move."
+        # The model's direction must therefore agree with the asset's ACTUAL
+        # recent movement. Verified 2026-08-07: the model bought NO @ 0.69
+        # (implied NO 0.86) while BTC was rising and the market held YES at
+        # 0.30-0.33 — a 25s drift from a stale reference price, not a lag.
+        # The market repriced against us and the position hit ~$0 in 5s.
+        # Requiring recent aligned momentum blocks exactly that failure: no
+        # fresh move in the model's direction -> there is nothing for the
+        # market to lag -> the "edge" is model error, not mispricing.
+        #
+        # Deliberate asymmetry: the momentum FALLBACK derives its probability
+        # from a 30s window (MOMENTUM_LOOKBACK_S) while this gate uses the 15s
+        # FRESH_MOVE_LOOKBACK_S. A move that happened ~20s ago therefore has
+        # strong 30s momentum but weak 15s momentum and gets blocked here.
+        # That is intentional: Polymarket usually reprices a dislocation
+        # within seconds, so a 20s-old move is already priced — nothing left
+        # to front-run.
+        fresh_move_ok = True
+        fresh_move_reason = ""
+        prices, _ = tracker.prices_and_timestamps(self.settings.FRESH_MOVE_LOOKBACK_S)
+        if len(prices) >= 2 and prices[0] > 0:
+            move = (prices[-1] - prices[0]) / prices[0]
+            aligned = (
+                (implied_prob > polymarket_prob and move > self.settings.FRESH_MOVE_MIN_PCT)
+                or (implied_prob < polymarket_prob and move < -self.settings.FRESH_MOVE_MIN_PCT)
+            )
+            if not aligned:
+                fresh_move_ok = False
+                fresh_move_reason = (
+                    f"no fresh aligned move (last {self.settings.FRESH_MOVE_LOOKBACK_S:.0f}s "
+                    f"momentum {move * 100:.3f}% vs required "
+                    f"±{self.settings.FRESH_MOVE_MIN_PCT * 100:.2f}% in model direction)"
+                )
+        else:
+            fresh_move_ok = False
+            fresh_move_reason = "insufficient ticks to confirm a fresh move"
+        if (
+            market.time_remaining_s is not None
+            and market.time_remaining_s < self.settings.MIN_ENTRY_TIME_REMAINING_S
+        ):
+            fresh_move_ok = False
+            fresh_move_reason = (
+                f"only {market.time_remaining_s:.0f}s left — below the "
+                f"{self.settings.MIN_ENTRY_TIME_REMAINING_S:.0f}s minimum for entries"
+            )
 
         confidence = _confidence_score(
             tick_age_s=tick_age,
@@ -378,12 +453,44 @@ class SignalEngine:
             target_side = ""
             edge_pct = 0.0
         else:
-            fired = edge_pct > self.settings.EDGE_THRESHOLD_PCT and confidence > self.settings.MIN_CONFIDENCE
-            reason = "OK" if fired else (
-                f"edge {edge_pct:.3f} <= threshold {self.settings.EDGE_THRESHOLD_PCT:.3f}"
-                if edge_pct <= self.settings.EDGE_THRESHOLD_PCT
-                else f"confidence {confidence:.3f} <= min {self.settings.MIN_CONFIDENCE:.3f}"
+            # Fee-aware edge: the raw model-vs-market gap must clear the taker
+            # fee on entry (the round-trip also pays an exit fee at early exit;
+            # settlement is free). Otherwise the "edge" is consumed by fees.
+            net_edge = edge_pct - self.settings.TAKER_FEE_PCT
+            # Price sanity: buying a token above MAX_DIRECTIONAL_ENTRY_PRICE
+            # means break-even requires being right 80%+ of the time — no
+            # model on a 5-minute window deserves that. Reject rather than
+            # overpay.
+            entry_price_ok = True
+            if target_book.best_ask is not None and target_book.best_ask > self.settings.MAX_DIRECTIONAL_ENTRY_PRICE:
+                entry_price_ok = False
+                reason = (
+                    f"entry ask {target_book.best_ask:.3f} > max "
+                    f"{self.settings.MAX_DIRECTIONAL_ENTRY_PRICE:.2f} (break-even "
+                    "probability too high after fees)"
+                )
+            elif model_saturated:
+                # A degenerate read is more fundamental than any missing fresh
+                # move — report the saturation, not the momentum.
+                reason = "model read saturated (clamped to sane band) — degenerate, not tradable"
+            elif not fresh_move_ok:
+                reason = fresh_move_reason
+            else:
+                reason = ""
+
+            fired = (
+                net_edge > self.settings.EDGE_THRESHOLD_PCT
+                and confidence > self.settings.MIN_CONFIDENCE
+                and entry_price_ok
+                and not model_saturated
+                and fresh_move_ok
             )
+            if not reason:
+                reason = "OK" if fired else (
+                    f"net edge {net_edge:.3f} <= threshold {self.settings.EDGE_THRESHOLD_PCT:.3f}"
+                    if net_edge <= self.settings.EDGE_THRESHOLD_PCT
+                    else f"confidence {confidence:.3f} <= min {self.settings.MIN_CONFIDENCE:.3f}"
+                )
 
         sig = Signal(
             market=market, side=target_side, implied_prob=implied_prob,

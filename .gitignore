@@ -1,5 +1,9 @@
 .env
 storage/*.db
+# SQLite WAL/shm sidecar files hold live trade-DB checkpoints — never push
+storage/*.db-shm
+storage/*.db-wal
+storage/*.db-journal
 storage/*.log
 *.log
 exports/
@@ -8,3 +12,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+# Command-center frontend deps + build output
+node_modules/
+command_center/ui/.next/
+# Runtime artifact the bot writes for the command-center API
+command_center/api/live_state.json
+
+# TypeScript incremental build cache
+*.tsbuildinfo

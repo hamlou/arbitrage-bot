@@ -42,6 +42,20 @@ class RiskManager:
 
         self._daily_halted = False
         self._kill_switch_tripped = False
+        # Last-computed values, exposed to the dashboard/CRM so it can show
+        # real risk numbers instead of only boolean flags.
+        self._last_daily_pnl_pct = 0.0
+        self._last_drawdown_pct = 0.0
+
+    @property
+    def daily_pnl_pct(self) -> float:
+        """Most recently computed daily PnL fraction (negative = losing day)."""
+        return self._last_daily_pnl_pct
+
+    @property
+    def drawdown_pct(self) -> float:
+        """Most recently computed drawdown fraction from peak equity."""
+        return self._last_drawdown_pct
 
     # -- Position sizing -----------------------------------------------------
 
@@ -129,6 +143,13 @@ class RiskManager:
 
         if self._peak_equity is None or current_balance > self._peak_equity:
             self._peak_equity = current_balance
+
+        # Record the latest numbers for the dashboard/CRM even when nothing
+        # trips — it should always show the current distance to the thresholds.
+        if self._day_start_equity and self._day_start_equity > 0:
+            self._last_daily_pnl_pct = (current_balance - self._day_start_equity) / self._day_start_equity
+        if self._peak_equity and self._peak_equity > 0:
+            self._last_drawdown_pct = (self._peak_equity - current_balance) / self._peak_equity
 
         # -- Daily loss halt --
         if self._day_start_equity and self._day_start_equity > 0 and not self._daily_halted:

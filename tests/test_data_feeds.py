@@ -5,13 +5,20 @@ using recorded fixture data. These tests never hit a live endpoint.
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import websockets.exceptions
 
 from data.binance_feed import BinanceFeed, PriceUpdate, _parse_message
-from data.polymarket_feed import OrderBook, OrderBookLevel, _parse_gamma_market
+from data.polymarket_feed import (
+    OrderBook,
+    OrderBookLevel,
+    PolymarketFeed,
+    _duration_from_time_range,
+    _parse_gamma_market,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -46,6 +53,247 @@ def test_parse_gamma_market_rejects_non_crypto_market():
     assert market is None  # "will it rain" market should be filtered out
 
 
+def test_parse_gamma_market_handles_json_string_clob_token_ids():
+    """
+    The /events/keyset response (used by discovery since 2026-08-04) encodes
+    clobTokenIds as a JSON string, not a list. Regression guard: parsing must
+    extract the real token IDs either way — a naive `tokens[0]` on the string
+    yielded '[' and '"', which silently broke the CLOB book fetch and the WS
+    subscription.
+    """
+    raw = {
+        "id": "559700",
+        "question": "Ethereum Up or Down - December 19, 11:30AM-11:35AM ET",
+        "clobTokenIds": json.dumps(["tok_yes_eth_live", "tok_no_eth_live"]),
+        "liquidity": "125000.50",
+        "endDate": "2026-12-19T16:35:00Z",
+        "closed": False,
+    }
+    market = _parse_gamma_market(raw)
+    assert market is not None
+    assert market.token_id_yes == "tok_yes_eth_live"
+    assert market.token_id_no == "tok_no_eth_live"
+
+
+# -- Live Gamma title format (timestamp window, not "5 min"/"15 min" text) --
+# Polymarket's current up/down titles are e.g. "Ethereum Up or Down -
+# December 19, 11:30AM-11:35AM ET". The old parser only matched "5 min"/
+# "15 min" text and silently returned 0 markets against live data — this
+# format is the regression guard.
+
+
+def test_parse_gamma_market_live_timestamp_format_5min():
+    raw = {
+        "id": "559700",
+        "question": "Ethereum Up or Down - December 19, 11:30AM-11:35AM ET",
+        "clobTokenIds": ["tok_yes_eth_live", "tok_no_eth_live"],
+        "liquidity": "125000.50",
+        "endDate": "2026-12-19T16:35:00Z",
+        "closed": False,
+    }
+    market = _parse_gamma_market(raw)
+    assert market is not None
+    assert market.asset == "ETH"
+    assert market.duration_minutes == 5
+
+
+def test_parse_gamma_market_live_timestamp_format_15min():
+    raw = {
+        "id": "559701",
+        "question": "Bitcoin Up or Down - December 19, 11:30AM-11:45AM ET",
+        "clobTokenIds": ["tok_yes_btc_live", "tok_no_btc_live"],
+        "liquidity": "250000.00",
+        "endDate": "2026-12-19T16:45:00Z",
+        "closed": False,
+    }
+    market = _parse_gamma_market(raw)
+    assert market is not None
+    assert market.asset == "BTC"
+    assert market.duration_minutes == 15
+
+
+def test_parse_gamma_market_rejects_non_updown_live_title():
+    """A BTC question without a duration (text or time window) must still be
+    rejected — e.g. long-dated 'Will the price of Bitcoin be above $70k'."""
+    raw = {
+        "id": "559702",
+        "question": "Will the price of Bitcoin be above $70,000 on August 4?",
+        "clobTokenIds": ["tok_yes_btc", "tok_no_btc"],
+        "liquidity": "100000.00",
+        "endDate": "2026-08-04T00:00:00Z",
+        "closed": False,
+    }
+    assert _parse_gamma_market(raw) is None
+
+
+@pytest.mark.parametrize(
+    "question,expected",
+    [
+        ("Up or Down - December 19, 11:30AM-11:35AM ET", 5),
+        ("Up or Down - December 19, 11:30AM-11:45AM ET", 15),
+        ("Up or Down - 11:55AM-12:05PM ET", None),  # 10 min, not 5/15
+        ("Up or Down - 12:00PM-12:05PM ET", 5),  # noon crossing
+        ("Up or Down - 12:00AM-12:15AM ET", 15),  # midnight crossing
+        ("Up or Down - 5 min - 14:00 ET", None),  # no window, keyword path
+        ("Will it rain in NYC tomorrow?", None),
+    ],
+)
+def test_duration_from_time_range(question: str, expected):
+    assert _duration_from_time_range(question) == expected
+
+
+async def test_discover_active_markets_uses_keyset_endpoint_with_updown_tag():
+    """
+    Regression guard for the 2026-08-04 live-data bug: the old /markets list
+    endpoint is deprecated/sunset (API returns `sunset: Fri, 01 May 2026` +
+    `warning: use /markets/keyset`) and serves stale Dec-2025 ghost rows, so
+    the bot found zero markets and could never trade. Discovery must use
+    /events/keyset with tag_slug=up-or-down, ordered endDate-ascending so the
+    soonest-ending (currently live) windows come first.
+    """
+    captured = {}
+
+    async def fake_gamma_get(path, params=None):
+        captured["path"] = path
+        captured["params"] = params
+        return []
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    await feed.discover_active_markets()
+
+    assert captured["path"] == "/events/keyset"
+    assert captured["params"]["tag_slug"] == "up-or-down"
+    assert captured["params"]["order"] == "endDate"
+    assert captured["params"]["ascending"] == "true"
+    assert captured["params"]["active"] == "true"
+
+
+def _keyset_event(market: dict, event_id: str = "ev1") -> dict:
+    return {"id": event_id, "title": market["question"], "markets": [market]}
+
+
+async def test_discover_active_markets_parses_nested_keyset_events():
+    """The keyset response nests markets inside events; discovery must flatten
+    them, keep only live windows within the lookahead, and dedupe."""
+    now = time.time()
+
+    def iso(offset_s: float) -> str:
+        return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    live_btc = {
+        "id": "111",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["t_yes_1", "t_no_1"],
+        "liquidity": "20000",
+        "endDate": iso(300),  # ending in 5 min
+        "closed": False,
+    }
+    far_future_btc = {
+        "id": "222",
+        "question": "Bitcoin Up or Down - August 6, 6:40AM-6:45AM ET",
+        "clobTokenIds": ["t_yes_2", "t_no_2"],
+        "liquidity": "50000",
+        "endDate": iso(2 * 86400),  # ends in 2 days — pre-created, not live
+        "closed": False,
+    }
+    thin_live_btc = {
+        "id": "333",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["t_yes_3", "t_no_3"],
+        "liquidity": "800",  # below the 5k floor
+        "endDate": iso(300),
+        "closed": False,
+    }
+
+    payload = {
+        "$schema": "x",
+        "events": [
+            _keyset_event(live_btc, "e1"),
+            _keyset_event(far_future_btc, "e2"),
+            _keyset_event(thin_live_btc, "e3"),
+            _keyset_event(live_btc, "e1"),  # duplicate market, same id
+        ],
+        "next_cursor": None,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return payload
+
+    feed = PolymarketFeed(min_liquidity_usd=5_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_active_markets()
+
+    # Only the live, sufficiently-liquid market survives; the far-future
+    # pre-created one and the thin one are dropped; the duplicate is deduped.
+    assert [m.market_id for m in markets] == ["111"]
+
+
+async def test_discover_active_markets_handles_plain_list_payload():
+    """Defensive: some Gamma endpoints return a bare list; discovery must not
+    crash on that shape."""
+
+    async def fake_gamma_get(path, params=None):
+        return []
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    assert await feed.discover_active_markets() == []
+
+
+async def test_discover_pages_past_ghost_crowd_to_find_live_windows():
+    """
+    Regression guard for the 2026-08-06 live-data bug: /events/keyset serves
+    inconsistent cached slices — sometimes the live up/down windows are buried
+    behind ~1,400 stale Dec-2025 ghost events still flagged active=true. With
+    a 5-page cap discovery gave up before reaching them (found 0 markets while
+    the bot sat idle). It must keep paging through the ghosts (using
+    next_cursor) until it reaches the live windows, then filter them in.
+    """
+    now = time.time()
+
+    def iso(offset_s: float) -> str:
+        return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    ghost = {
+        "id": "999",
+        "question": "Bitcoin Up or Down - December 19, 11:30AM-11:35AM ET",
+        "clobTokenIds": ["t_g_yes", "t_g_no"],
+        "liquidity": "0",
+        "endDate": "2025-12-19T16:35:00Z",  # stale ghost, far in the past
+        "closed": False,
+    }
+    live = {
+        "id": "555",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["t_l_yes", "t_l_no"],
+        "liquidity": "12000",
+        "endDate": iso(300),  # live window, ending in 5 min
+        "closed": False,
+    }
+
+    calls = []
+
+    async def fake_gamma_get(path, params=None):
+        calls.append(dict(params or {}))
+        # Page 1: ghosts only. Page 2: the live window. Any later: empty.
+        if params and params.get("cursor"):
+            return {"events": [_keyset_event(live, "e-live")], "next_cursor": None}
+        return {
+            "events": [_keyset_event(ghost, "e-g")] * 3,
+            "next_cursor": "cursor-2",
+        }
+
+    feed = PolymarketFeed(min_liquidity_usd=1_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_active_markets()
+
+    # It must have paginated (used the cursor), and only the live window
+    # survives — the Dec-2025 ghost is filtered by both liquidity and horizon.
+    assert len(calls) >= 2
+    assert calls[1]["cursor"] == "cursor-2"
+    assert [m.market_id for m in markets] == ["555"]
+
 def test_liquidity_filter_excludes_thin_markets():
     """MIN_MARKET_LIQUIDITY_USD filtering is applied by the caller
     (discover_active_markets); this test checks the raw parse + a manual
@@ -61,6 +309,98 @@ def test_liquidity_filter_excludes_thin_markets():
     # rain market was already excluded for not being a crypto up/down market.
     assert len(eligible) == 1
     assert eligible[0].asset == "BTC"
+
+
+# -- Resolved-outcome parsing (settlement) -------------------------------------
+
+async def test_get_market_outcome_parses_outcome_prices_yes_wins():
+    """
+    The Gamma market payload no longer carries the legacy `outcome` field —
+    resolution is now `outcomes` + `outcomePrices` + `umaResolutionStatus`.
+    Regression guard: settlement must read the winner out of outcomePrices
+    (index 0 = YES token, index 1 = NO token) or positions stay OPEN forever.
+    """
+    raw = {
+        "id": "559700",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["tok_yes", "tok_no"],
+        "outcomes": ["Up", "Down"],
+        "outcomePrices": ["1", "0"],  # Up won -> YES token won
+        "umaResolutionStatus": "resolved",
+        "closed": True,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return raw
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    assert await feed.get_market_outcome("559700") == "YES"
+
+
+async def test_get_market_outcome_parses_outcome_prices_no_wins():
+    raw = {
+        "id": "559700",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["tok_yes", "tok_no"],
+        "outcomes": ["Up", "Down"],
+        "outcomePrices": ["0", "1"],  # Down won -> NO token won
+        "umaResolutionStatus": "resolved",
+        "closed": True,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return raw
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    assert await feed.get_market_outcome("559700") == "NO"
+
+
+async def test_get_market_outcome_handles_json_string_prices():
+    """
+    Verified live 2026-08-06: Gamma encodes outcomePrices as a JSON STRING
+    (e.g. '"["0","1"]"'), not a list — same shape trap as clobTokenIds. A
+    plain isinstance(prices, list) check silently returns None and settlement
+    never fires. Regression guard for the normalized shape.
+    """
+    raw = {
+        "id": "559700",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["tok_yes", "tok_no"],
+        "outcomes": ["Up", "Down"],
+        "outcomePrices": json.dumps(["0", "1"]),  # JSON string, Down won
+        "umaResolutionStatus": "resolved",
+        "closed": True,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return raw
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    assert await feed.get_market_outcome("559700") == "NO"
+
+
+async def test_get_market_outcome_returns_none_while_pending():
+    """A not-yet-resolved market must return None so the caller retries later
+    instead of settling at a wrong outcome."""
+    raw = {
+        "id": "559700",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["tok_yes", "tok_no"],
+        "outcomes": ["Up", "Down"],
+        "outcomePrices": ["0.4", "0.6"],  # still trading, not resolved
+        "umaResolutionStatus": None,
+        "closed": False,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return raw
+
+    feed = PolymarketFeed(min_liquidity_usd=1)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    assert await feed.get_market_outcome("559700") is None
 
 
 # -- Order book parsing / mid / depth --------------------------------------------

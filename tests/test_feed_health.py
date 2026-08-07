@@ -116,6 +116,22 @@ def test_seconds_since_last_message(health, clock):
     assert health.seconds_since_last_message("binance") == pytest.approx(4.0)
 
 
+def test_is_feed_healthy_per_feed(health, clock):
+    """is_feed_healthy() must report each feed independently, not the
+    combined is_healthy() result — this is what the dashboard wiring
+    relies on to show two separate indicators instead of one."""
+    health.record_message("binance")
+    # polymarket never messaged.
+    assert health.is_feed_healthy("binance") is True
+    assert health.is_feed_healthy("polymarket") is False
+    assert health.is_healthy() is False  # combined still reflects the sick one
+
+
+def test_is_feed_healthy_unknown_feed_raises(health):
+    with pytest.raises(ValueError):
+        health.is_feed_healthy("not_a_feed")
+
+
 def test_health_tracks_feeds_independently(health, clock):
     """One sick feed must not be masked by a healthy one."""
     health.record_message("binance")

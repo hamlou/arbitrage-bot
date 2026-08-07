@@ -71,6 +71,66 @@ async def test_load_open_positions_restores_after_restart(db):
     assert broker2.has_open_position("m1")
 
 
+async def test_restart_reconstructs_balance_from_trade_ledger(db):
+    """Regression guard (2026-08-06): the paper balance is an in-memory float
+    that reset to the starting balance on every restart, so a restart with
+    open positions re-counted money that was already spent — the equity curve
+    visibly jumped UP ~$43 on a real restart. load_open_positions() must
+    reconstruct cash from the TRADE LEDGER (starting balance + closed PnL -
+    open costs), not from the corrupted equity curve."""
+    books = {"tok_yes": make_symmetric_book("tok_yes"), "tok_no": make_symmetric_book("tok_no")}
+    feed = FakeFeed(books)
+    market = make_market()
+
+    broker1 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    await broker1.place_order(market, "YES", 100)  # balance now 900
+
+    # Restart: fresh broker with the same DB, but poison the equity curve to
+    # prove the ledger (not the curve) is the source of truth.
+    await db.record_equity(mode="PAPER", balance_usd=9999.0)
+
+    broker2 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    await broker2.load_open_positions()
+    assert await broker2.get_balance() == pytest.approx(900)
+
+
+async def test_load_open_positions_is_idempotent(db):
+    """Regression guard: balance reconstruction must start from the fixed
+    starting-balance baseline captured at construction, so calling
+    load_open_positions() twice never double-counts closed PnL or open costs."""
+    books = {"tok_yes": make_symmetric_book("tok_yes"), "tok_no": make_symmetric_book("tok_no")}
+    feed = FakeFeed(books)
+    market = make_market()
+
+    broker1 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    await broker1.place_order(market, "YES", 100)
+
+    broker2 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    await broker2.load_open_positions()
+    first = await broker2.get_balance()
+    await broker2.load_open_positions()  # second call must not re-add/subtract
+    assert await broker2.get_balance() == pytest.approx(first)
+
+
+async def test_restart_balance_includes_closed_pnl(db):
+    """A closed winner must be added back into the reconstructed balance on a
+    restart, not just the open-position costs subtracted."""
+    books = {"tok_yes": make_symmetric_book("tok_yes"), "tok_no": make_symmetric_book("tok_no")}
+    feed = FakeFeed(books)
+    market = make_market()
+
+    broker1 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    fill = await broker1.place_order(market, "YES", 100)
+    # Close it as a winner at 0.60 vs 0.56 entry.
+    books["tok_yes"] = make_symmetric_book("tok_yes", best_bid=0.60, best_ask=0.62)
+    await broker1.close_position_early(market, fill.trade_id, reason="TAKE_PROFIT")
+
+    broker2 = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    await broker2.load_open_positions()
+    # 1000 - 100 (cost) + (0.60/0.56*100 = 107.14 proceeds, fee 0) = 1007.14
+    assert await broker2.get_balance() == pytest.approx(1007.142857, rel=1e-3)
+
+
 async def test_settle_position_works_after_restart_recovery(db):
     books = {"tok_yes": make_symmetric_book("tok_yes"), "tok_no": make_symmetric_book("tok_no")}
     market = make_market()

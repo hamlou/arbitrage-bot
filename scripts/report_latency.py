@@ -5,7 +5,14 @@ window so you can see, concretely, whether this bot is fast enough to matter.
 
 Usage:
     python scripts/report_latency.py
-    python scripts/report_latency.py --window-s 2.7
+    python scripts/report_latency.py --window-s 2.0
+
+Window default: 2.0s (settings.ASSUMED_ARBITRAGE_WINDOW_S). This replaces the
+old 2.7s guess — measured quote-response lags for Polymarket's short-duration
+crypto up/down markets cluster ~347ms with exploitable dislocations up to ~2s
+(OpenMarket 2026 dataset, arxiv.org/html/2607.26245v1). Polymarket's CLOB also
+imposes a fixed 250ms taker-order delay (itode) on these markets, which is
+added to the measured latency when judging the window.
 """
 from __future__ import annotations
 
@@ -68,15 +75,25 @@ async def report(window_s: float) -> None:
               f"p99: {_percentile(tick_to_order, 0.99):8.1f}   max: {max(tick_to_order, default=0):8.1f}")
 
         window_ms = window_s * 1000
+        platform_delay_ms = settings.PLATFORM_TAKER_DELAY_MS
         p95 = _percentile(tick_to_order, 0.95)
+        # Polymarket's CLOB holds marketable orders for a fixed 250ms
+        # taker-delay window (itode) on fast up/down markets — that is ON TOP
+        # of our measured tick->order latency, so it must be added before
+        # comparing against the window.
+        total_ms = p95 + platform_delay_ms
         print()
         print(f"Assumed arbitrage window: {window_s:.1f}s ({window_ms:.0f}ms)")
-        if p95 < window_ms * 0.5:
-            print(f"RESULT: comfortable — p95 latency ({p95:.0f}ms) is well under half the window.")
-        elif p95 < window_ms:
-            print(f"RESULT: tight — p95 latency ({p95:.0f}ms) is under the window but with little margin.")
+        print(f"  (window per OpenMarket 2026: ~347ms median lag, up to ~2s dislocations)")
+        print(f"Measured p95 tick->order: {p95:.0f}ms")
+        print(f"+ CLOB taker delay (itode, fixed): {platform_delay_ms:.0f}ms")
+        print(f"= p95 end-to-end: {total_ms:.0f}ms")
+        if total_ms < window_ms * 0.5:
+            print(f"RESULT: comfortable — end-to-end p95 ({total_ms:.0f}ms) is well under half the window.")
+        elif total_ms < window_ms:
+            print(f"RESULT: tight — end-to-end p95 ({total_ms:.0f}ms) is under the window but with little margin.")
         else:
-            print(f"RESULT: too slow — p95 latency ({p95:.0f}ms) meets or exceeds the assumed window "
+            print(f"RESULT: too slow — end-to-end p95 ({total_ms:.0f}ms) meets or exceeds the assumed window "
                   f"({window_ms:.0f}ms). Orders at this latency are likely reacting to a book that has "
                   f"already moved. Fix latency before trusting paper-mode expectancy numbers.")
     else:
@@ -87,10 +104,9 @@ async def report(window_s: float) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Report latency percentiles vs. the arbitrage window.")
     parser.add_argument(
-        "--window-s", type=float, default=2.7,
-        help="Assumed arbitrage window in seconds (default 2.7, per the most recent reporting "
-             "referenced when this project was built — verify this number is still current before "
-             "trusting the comparison).",
+        "--window-s", type=float, default=settings.ASSUMED_ARBITRAGE_WINDOW_S,
+        help=f"Assumed arbitrage window in seconds (default {settings.ASSUMED_ARBITRAGE_WINDOW_S}, "
+             "per the OpenMarket 2026 measurement).",
     )
     args = parser.parse_args()
     asyncio.run(report(args.window_s))

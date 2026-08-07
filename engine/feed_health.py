@@ -90,17 +90,25 @@ class FeedHealth:
             return None
         return self._clock() - last
 
+    def is_feed_healthy(self, feed: str) -> bool:
+        """
+        True if THIS single feed has reconnected at most MAX_RECONNECTS times
+        in the last window AND received a message within the last
+        MAX_STALE_S seconds (a never-messaged feed is unhealthy). Exposed
+        separately from is_healthy() so callers (e.g. the dashboard) can
+        show per-feed status instead of only a combined bool.
+        """
+        self._require_feed(feed)
+        if self.reconnect_count(feed) > MAX_RECONNECTS:
+            return False
+        since = self.seconds_since_last_message(feed)
+        if since is None or since > MAX_STALE_S:
+            return False
+        return True
+
     def is_healthy(self) -> bool:
         """
-        True only if BOTH feeds are healthy: each has reconnected at most
-        MAX_RECONNECTS times in the last window AND received a message within
-        the last MAX_STALE_S seconds (or is not stale if it never received
-        one — a never-messaged feed is unhealthy).
+        True only if BOTH feeds are healthy. See is_feed_healthy() for the
+        per-feed definition.
         """
-        for feed in FEEDS:
-            if self.reconnect_count(feed) > MAX_RECONNECTS:
-                return False
-            since = self.seconds_since_last_message(feed)
-            if since is None or since > MAX_STALE_S:
-                return False
-        return True
+        return all(self.is_feed_healthy(feed) for feed in FEEDS)

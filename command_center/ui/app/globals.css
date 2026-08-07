@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   Design tokens — dark is the default (a trading terminal).
+   .light flips every variable; components need no theme logic.
+   ============================================================ */
+:root {
+  --bg: 9 9 14;
+  --surface: 15 15 23;
+  --elevated: 20 20 31;
+  --raised: 26 26 40;
+  --line: 255 255 255 / 0.07;
+  --edge: 255 255 255 / 0.12;
+
+  --ink: 233 233 241;
+  --ink-muted: 154 154 172;
+  --ink-faint: 104 104 128;
+
+  --brand: 124 108 255;
+  --brand-soft: 124 108 255 / 0.14;
+
+  --ok: 52 211 153;
+  --ok-soft: 52 211 153 / 0.13;
+  --warn: 251 191 36;
+  --warn-soft: 251 191 36 / 0.13;
+  --danger: 251 113 133;
+  --danger-soft: 251 113 133 / 0.13;
+  --info: 56 189 248;
+  --info-soft: 56 189 248 / 0.13;
+
+  color-scheme: dark;
+}
+
+.light {
+  --bg: 248 249 251;
+  --surface: 255 255 255;
+  --elevated: 250 250 252;
+  --raised: 244 245 248;
+  --line: 15 15 40 / 0.07;
+  --edge: 15 15 40 / 0.14;
+
+  --ink: 16 16 24;
+  --ink-muted: 94 94 112;
+  --ink-faint: 142 142 160;
+
+  --brand: 98 78 255;
+  --brand-soft: 98 78 255 / 0.1;
+
+  --ok: 4 150 101;
+  --ok-soft: 4 150 101 / 0.1;
+  --warn: 180 124 0;
+  --warn-soft: 180 124 0 / 0.1;
+  --danger: 225 29 72;
+  --danger-soft: 225 29 72 / 0.1;
+  --info: 2 132 199;
+  --info-soft: 2 132 199 / 0.1;
+
+  color-scheme: light;
+}
+
+@layer base {
+  * {
+    border-color: rgb(var(--line));
+  }
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    @apply bg-bg text-ink font-sans antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+  ::selection {
+    background: rgb(var(--brand) / 0.3);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--ink-faint) / 0.4) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: rgb(var(--ink-faint) / 0.35);
+    border-radius: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  :focus-visible {
+    outline: 2px solid rgb(var(--brand) / 0.6);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+  .text-gradient-brand {
+    background: linear-gradient(120deg, rgb(var(--brand)), rgb(var(--info)));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .glass {
+    background: rgb(var(--surface) / 0.7);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+}

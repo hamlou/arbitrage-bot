@@ -153,6 +153,29 @@ async def test_trading_cycle_skips_and_logs_when_feed_unhealthy(app_settings, ca
         assert "feed_unhealthy" in caplog.text
         open_trades = await app.db.get_open_trades(mode="PAPER")
         assert open_trades == []  # the cycle was skipped entirely
+        # Regression check: the dashboard must reflect the real unhealthy
+        # state even though the cycle returned early, not stay stuck on the
+        # DashboardState defaults (which happen to also be False, so this
+        # confirms the flags were actively set, not just never touched).
+        assert app._dashboard_state.binance_feed_healthy is False
+        assert app._dashboard_state.polymarket_feed_healthy is False
+    finally:
+        await app.db.close()
+
+
+async def test_trading_cycle_dashboard_reflects_partial_feed_health(app_settings, caplog):
+    """One healthy feed and one sick feed must show up independently on the
+    dashboard, not be collapsed into a single combined flag."""
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        # polymarket feed never messages -> stays unhealthy.
+
+        with caplog.at_level(logging.WARNING, logger="main"):
+            await app._trading_cycle()
+
+        assert app._dashboard_state.binance_feed_healthy is True
+        assert app._dashboard_state.polymarket_feed_healthy is False
     finally:
         await app.db.close()
 
@@ -179,6 +202,8 @@ async def test_trading_cycle_proceeds_when_feeds_healthy(app_settings):
 
         open_trades = await app.db.get_open_trades(mode="PAPER")
         assert len(open_trades) == 1
+        assert app._dashboard_state.binance_feed_healthy is True
+        assert app._dashboard_state.polymarket_feed_healthy is True
     finally:
         await app.db.close()
 
