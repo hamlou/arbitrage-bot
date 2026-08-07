@@ -830,6 +830,11 @@ class TradingApp:
         """
         Without this, positions could only ever be held to expiry. Checks
         every open position each cycle for:
+          - reprice (round-trip protocol): the market has repriced toward the
+            entry side within the arbitrage window — bank the convergence
+            gain and free the capital for the next trade. This is the piece
+            that gives the strategy its high win rate (a bet the market
+            CORRECTS, not a bet on the final outcome).
           - take-profit: current mark-to-market value has gained at least
             TAKE_PROFIT_PCT of stake
           - edge reversal: our own model's current read on this market has
@@ -844,11 +849,12 @@ class TradingApp:
             # Sum-to-one legs are outcome-agnostic by construction (we hold
             # BOTH sides to settlement; whichever wins pays $1, and the combo
             # locked a profit below that). The directional model's opinion is
-            # meaningless for them, so TAKE_PROFIT / EDGE_REVERSAL must NEVER
-            # fire on a sum_to_one leg — exiting one leg early breaks the
-            # hedge. Verified 2026-08-07: the model "reversed" the NO leg of
-            # an ETH combo and sold it at 0.854 when holding to settlement
-            # would have paid 1.0 — turning a guaranteed win into a loss.
+            # meaningless for them, so REPRICE / TAKE_PROFIT / EDGE_REVERSAL
+            # must NEVER fire on a sum_to_one leg — exiting one leg early
+            # breaks the hedge. Verified 2026-08-07: the model "reversed" the
+            # NO leg of an ETH combo and sold it at 0.854 when holding to
+            # settlement would have paid 1.0 — turning a guaranteed win into
+            # a loss.
             if (t.get("strategy") or "latency_arb") == "sum_to_one":
                 continue
             market = self._known_markets.get(t["market_id"])
@@ -856,14 +862,52 @@ class TradingApp:
                 continue
 
             token_id = market.token_id_yes if t["side"] == "YES" else market.token_id_no
+            # Prefer the WS-cached book (zero-latency read, same source the
+            # fast path fills against) so a round-trip exit is as fast as the
+            # entry that triggered it; fall back to REST when the cache isn't
+            # fresh. The round-trip protocol only works if the exit doesn't
+            # eat the window the entry just won. Note the source split: this
+            # DECISION reads the cache, but the actual SELL
+            # (close_position_early) walks the REST book — in paper mode both
+            # are the same live market and REST is authoritative for the
+            # fill; the cache only decides WHEN to attempt the exit.
+            book = None
             try:
-                book = await self.feed.get_order_book(market.market_id, token_id)
+                if self.ws_feed.is_fresh(token_id):
+                    book = self.ws_feed.get_cached_book(token_id)
             except Exception:
-                continue
+                book = None
+            if book is None:
+                try:
+                    book = await self.feed.get_order_book(market.market_id, token_id)
+                except Exception:
+                    continue
             if book.mid is None:
                 continue
 
             unrealized_pct = (book.mid - t["entry_price"]) / t["entry_price"]
+
+            # Round-trip protocol (the missing piece — see the AdiiX article
+            # and REPRICE_EXIT_* settings): while the position is still inside
+            # the reprice window, exit the moment the held token has gained
+            # >= REPRICE_EXIT_GAIN_PCT from entry. This is a bet that the
+            # market CORRECTS toward the side we bought (near-certain), not a
+            # bet on the final outcome (a coin flip — our own calibration
+            # measured ~52%). Holding to settlement was silently converting
+            # every good lag entry into an EV-negative outcome bet; the
+            # round-trip both raises the win rate and frees capital for the
+            # next of hundreds of daily entries. After REPRICE_EXIT_MAX_HOLD_S
+            # the arbitrage is gone, so the exit stops applying and the
+            # normal exits take over.
+            entry_ts = t.get("entry_ts") or 0.0
+            held_s = time.time() - entry_ts
+            if (
+                held_s <= settings.REPRICE_EXIT_MAX_HOLD_S
+                and unrealized_pct >= settings.REPRICE_EXIT_GAIN_PCT
+            ):
+                await self._try_early_exit(market, t["id"], "REPRICE")
+                continue
+
             if unrealized_pct >= settings.TAKE_PROFIT_PCT:
                 await self._try_early_exit(market, t["id"], "TAKE_PROFIT")
                 continue
@@ -1189,6 +1233,8 @@ class TradingApp:
             "fresh_move_min_pct": f"{settings.FRESH_MOVE_MIN_PCT:.2%} in {settings.FRESH_MOVE_LOOKBACK_S:.0f}s",
             "min_entry_time_remaining_s": f"{settings.MIN_ENTRY_TIME_REMAINING_S:.0f}s",
             "fast_path_trigger_pct": f"{settings.FAST_PATH_MOVE_TRIGGER_PCT:.2%} since last eval",
+            "reprice_exit_gain_pct": f"{settings.REPRICE_EXIT_GAIN_PCT:.0%} token gain",
+            "reprice_exit_max_hold_s": f"{settings.REPRICE_EXIT_MAX_HOLD_S:.0f}s",
             "daily_loss_halt_pct": f"{settings.DAILY_LOSS_HALT_PCT:.0%}",
             "drawdown_kill_pct": f"{settings.TOTAL_DRAWDOWN_KILL_PCT:.0%}",
             "sum_to_one_min_edge_pct": f"{settings.SUM_TO_ONE_MIN_EDGE_PCT:.2%}",

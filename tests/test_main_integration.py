@@ -443,6 +443,77 @@ async def test_early_exit_skips_sum_to_one_legs(app_settings):
         await app.db.close()
 
 
+async def test_reprice_exit_banks_convergence(app_settings):
+    """
+    Round-trip protocol (the strategy's high-win-rate piece): a directional
+    position whose held token has repriced >= REPRICE_EXIT_GAIN_PCT toward the
+    entry side while still inside the reprice window must be exited with
+    reason=REPRICE. This is a bet that the market CORRECTS (near-certain), not
+    a bet on the final outcome (a coin flip) — holding to settlement was
+    silently converting every good lag entry into an outcome bet.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        assert fill.avg_price < 0.60  # entered near the stale 0.50 book
+
+        # The market reprices toward the entry side: mid now ~0.58 (a
+        # ~14% token gain, well past the 7% reprice threshold).
+        repriced = make_book(market.token_id_yes, 0.57, 0.59)
+        app.feed.books[market.token_id_yes] = repriced
+
+        await app._check_early_exits(equity=1000)
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "REPRICE"
+        assert closed[0]["realized_pnl_usd"] > 0  # banked the reprice, net of fees
+    finally:
+        await app.db.close()
+
+
+async def test_reprice_exit_ignored_after_max_hold(app_settings):
+    """
+    Once REPRICE_EXIT_MAX_HOLD_S has elapsed, the arbitrage window is gone —
+    the REPRICE exit must NOT fire even if the token has gained more than
+    REPRICE_EXIT_GAIN_PCT. The position falls through to the normal exits
+    (TAKE_PROFIT / EDGE_REVERSAL / settlement), which are stricter.
+    """
+    app = await build_app(app_settings)
+    try:
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        # Age the position well past the reprice window (entry_ts is set by
+        # place_order to now).
+        conn = app.db._conn
+        await conn.execute(
+            "UPDATE trades SET entry_ts = ? WHERE id = ?",
+            (time.time() - 10_000, fill.trade_id),
+        )
+        await conn.commit()
+
+        repriced = make_book(market.token_id_yes, 0.57, 0.59)  # ~14% token gain
+        app.feed.books[market.token_id_yes] = repriced
+
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 1  # REPRICE skipped; ~14% < TAKE_PROFIT 50%
+    finally:
+        await app.db.close()
+
+
 async def test_duplicate_position_prevented(app_settings):
     app = await build_app(app_settings)
     try:

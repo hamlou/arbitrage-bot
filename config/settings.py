@@ -42,8 +42,24 @@ class Settings(BaseSettings):
     MAX_TOTAL_EXPOSURE_PCT: float = 0.30
 
     # --- Signal thresholds --------------------------------------------------
-    EDGE_THRESHOLD_PCT: float = 0.05
-    MIN_CONFIDENCE: float = 0.85
+    # Divergence band aligned with the latency-arb protocol (AdiiX article,
+    # "The 4 strategies"): "When Polymarket's contract odds diverge from what
+    # the CEX data implies by more than your threshold (typically 3-5%), buy
+    # the correct side." Lowered 0.05 -> 0.04 on 2026-08-07 together with the
+    # round-trip exit: entries are now short convergence bets (exit-on-reprice
+    # banks the repricing, which usually overshoots the entry edge), so the
+    # entry bar no longer needs to fund a hold-to-settlement outcome bet.
+    # Net-of-fee threshold: raw edge must clear TAKER_FEE_PCT (2%) on top.
+    EDGE_THRESHOLD_PCT: float = 0.04
+    # Confidence is mean(freshness, depth/2000, consistency) — the consistency
+    # term is always 1 on the fair-value path, so this gate's real job is to
+    # reject STALE data (freshness decays to 0 by 5s) and near-empty books.
+    # 0.85 required depth >= $2100 — nearly never true on live BTC/ETH books
+    # ($500-2000), which silently throttled the fast path to ~0 trades/day
+    # regardless of how many real divergences appeared. 0.75 keeps the
+    # stale-data protection while letting depth >= ~$600 books trade.
+    # Lowered 2026-08-07.
+    MIN_CONFIDENCE: float = 0.75
     MIN_MARKET_LIQUIDITY_USD: float = 1_000.0
 
     # --- Entry discipline (directional strategy) ---------------------------
@@ -111,6 +127,37 @@ class Settings(BaseSettings):
     # the position's original side by more than this — i.e. our own model no
     # longer agrees with the trade we're holding.
     EDGE_REVERSAL_EXIT_THRESHOLD_PCT: float = 0.10
+
+    # --- Round-trip protocol (exit on reprice — the 98%-win-rate piece) ----
+    # The strategy's high win rate does NOT come from prediction. It comes
+    # from EXITING ON CONVERGENCE: enter the lagging side, then sell when
+    # Polymarket reprices toward the true value (AdiiX article: "Within 2-3
+    # seconds ... the odds shift from 54/46 toward the 'true' 78/22. The bot
+    # can exit at this point for an immediate profit from the repricing").
+    # That is a bet that the market CORRECTS (near-certain), not a bet on
+    # the final outcome (a coin flip — our own calibration measured ~52%).
+    # Holding every position to settlement was silently converting each good
+    # lag entry into an EV-negative outcome bet (EV = p*win - (1-p)*stake
+    # with p~0.52 and a 2% fee each way). Two knobs:
+    #   REPRICE_EXIT_GAIN_PCT: exit when the held token has gained this
+    #     fraction from entry. Break-even is NOT just the fees — it is the
+    #     whole round trip through the SPREAD: we bought at the ask (~1-2c
+    #     above mid on these books) and sell at the bid, so a ~1c spread on
+    #     a ~0.50 token is ~4% plus ~4.1% of fees. A real net profit needs
+    #     roughly an 8%+ token gain, which is why this is set at 7% (the
+    #     first rung where exits bank a small net profit, ~+2% of size) and
+    #     the protocol is tuned for the BIG reprices — the article's example
+    #     reprice is 20+ points on the token (a 0.6% BTC move shifts a
+    #     15-min window's probability by 20+ points), so actual exits land
+    #     well above the threshold. Deliberately checked BEFORE TAKE_PROFIT:
+    #     a position that would settle +60% exits at the reprice threshold
+    #     instead — the round-trip caps winners on purpose, trading cadence
+    #     and win rate for the occasional big hold.
+    #   REPRICE_EXIT_MAX_HOLD_S: if the market hasn't repriced within this
+    #     window, the arbitrage is gone — stop waiting and let the normal
+    #     exits (TAKE_PROFIT / EDGE_REVERSAL / settlement) take over.
+    REPRICE_EXIT_GAIN_PCT: float = 0.07
+    REPRICE_EXIT_MAX_HOLD_S: float = 240.0
 
     # --- Sum-to-one (combo) arbitrage -----------------------------------------
     # If YES_ask + NO_ask (net of modeled fees) is under $1 by at least this
@@ -218,6 +265,7 @@ class Settings(BaseSettings):
         "MAX_TOTAL_EXPOSURE_PCT",
         "SUM_TO_ONE_MAX_POSITION_PCT",
         "EDGE_REVERSAL_EXIT_THRESHOLD_PCT",
+        "REPRICE_EXIT_GAIN_PCT",
         "EDGE_THRESHOLD_PCT",
         "MIN_CONFIDENCE",
     )

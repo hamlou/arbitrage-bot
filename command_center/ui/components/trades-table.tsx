@@ -276,7 +276,7 @@ export function TradesTable() {
                             "rounded-full px-2 py-0.5 text-[10px] font-medium",
                             t.status === "OPEN"
                               ? "bg-brand-soft text-brand"
-                              : t.exit_reason === "TAKE_PROFIT"
+                              : t.exit_reason === "TAKE_PROFIT" || t.exit_reason === "REPRICE"
                                 ? "bg-ok-soft text-ok"
                                 : t.exit_reason === "SETTLED"
                                   ? "bg-raised text-ink-muted"
@@ -362,7 +362,11 @@ function TradeDetail({ trade, onClose }: { trade: Trade | null; onClose: () => v
               <>
                 <DetailCell label="Closed" v={fmtDateTime(trade.exit_ts)} />
                 <DetailCell label="Exit price" v={trade.exit_price !== null ? `$${trade.exit_price.toFixed(4)}` : "—"} mono />
-                <DetailCell label="Exit reason" v={trade.exit_reason ?? "—"} tone={trade.exit_reason === "TAKE_PROFIT" ? "ok" : "neutral"} />
+                <DetailCell
+                  label="Exit reason"
+                  v={trade.exit_reason ?? "—"}
+                  tone={trade.exit_reason === "TAKE_PROFIT" || trade.exit_reason === "REPRICE" ? "ok" : "neutral"}
+                />
                 <DetailCell
                   label="Age at close"
                   v={fmtAgo(trade.exit_ts ?? trade.entry_ts)}

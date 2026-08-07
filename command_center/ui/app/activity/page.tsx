@@ -81,7 +81,9 @@ function Row({ item, last }: { item: ActivityItem; last: boolean }) {
               <Badge tone="info">+{(item.edge_pct * 100).toFixed(1)}% edge</Badge>
             )}
             {item.type === "trade" && item.exit_reason && item.exit_reason !== "SETTLED" && (
-              <Badge tone={item.exit_reason === "TAKE_PROFIT" ? "ok" : "warn"}>{item.exit_reason}</Badge>
+              <Badge tone={item.exit_reason === "TAKE_PROFIT" || item.exit_reason === "REPRICE" ? "ok" : "warn"}>
+                {item.exit_reason}
+              </Badge>
             )}
           </div>
           <span className="shrink-0 font-mono text-[11px] tabular text-ink-faint">{fmtAgo(item.ts)}</span>
