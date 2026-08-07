@@ -93,6 +93,15 @@ class Database:
         migrations = {
             "strategy": "ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'latency_arb'",
             "combo_group_id": "ALTER TABLE trades ADD COLUMN combo_group_id TEXT",
+            # Fill-realism measurement (2026-08-07): the broker computes
+            # slippage and decision/fill best-asks on every fill but never
+            # persisted them — the single most useful paper-mode metric
+            # ("how much edge did we lose between deciding and filling?") was
+            # computed and thrown away. Add the columns so existing DBs get
+            # them too.
+            "slippage_pct": "ALTER TABLE trades ADD COLUMN slippage_pct REAL",
+            "decision_best_ask": "ALTER TABLE trades ADD COLUMN decision_best_ask REAL",
+            "fill_best_ask": "ALTER TABLE trades ADD COLUMN fill_best_ask REAL",
         }
         for column, ddl in migrations.items():
             if column not in existing_columns:
@@ -173,17 +182,22 @@ class Database:
         fee_usd: float,
         strategy: str = "latency_arb",
         combo_group_id: Optional[str] = None,
+        slippage_pct: Optional[float] = None,
+        decision_best_ask: Optional[float] = None,
+        fill_best_ask: Optional[float] = None,
     ) -> int:
         conn = self._require_conn()
         cur = await conn.execute(
             """
             INSERT INTO trades
                 (signal_id, market_id, asset, side, mode, strategy, combo_group_id,
-                 entry_ts, entry_price, size_usd, fee_usd, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                 entry_ts, entry_price, size_usd, fee_usd,
+                 slippage_pct, decision_best_ask, fill_best_ask, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
             """,
             (signal_id, market_id, asset, side, mode, strategy, combo_group_id,
-             time.time(), entry_price, size_usd, fee_usd),
+             time.time(), entry_price, size_usd, fee_usd,
+             slippage_pct, decision_best_ask, fill_best_ask),
         )
         await conn.commit()
         return cur.lastrowid
@@ -368,5 +382,46 @@ class Database:
             cur = await conn.execute(
                 "SELECT * FROM exchange_disagreements ORDER BY ts DESC LIMIT ?", (limit,)
             )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # -- lag events (empirical arbitrage-window measurement) -----------------
+
+    async def log_lag_event(
+        self,
+        *,
+        asset: str,
+        move_pct: float,
+        move_dir: str,
+        token_id: str,
+        binance_move_ts: float,
+        baseline_mid: Optional[float] = None,
+        poly_repriced_ts: Optional[float] = None,
+        poly_move_pct: Optional[float] = None,
+        timed_out: int = 0,
+        lag_ms: Optional[float] = None,
+    ) -> None:
+        """Record one measured Binance-move -> Polymarket-reprice lag. Written
+        by main.py's lag tracker loop; pure diagnostics, never read by any
+        trading decision."""
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO lag_events
+                (ts, asset, move_pct, move_dir, token_id, binance_move_ts,
+                 baseline_mid, poly_repriced_ts, poly_move_pct, timed_out, lag_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (time.time(), asset, move_pct, move_dir, token_id, binance_move_ts,
+             baseline_mid, poly_repriced_ts, poly_move_pct, timed_out, lag_ms),
+        )
+        await conn.commit()
+
+    async def get_lag_events(self, since_ts: float = 0.0) -> list[dict[str, Any]]:
+        """All lag measurements (or since a timestamp), oldest first."""
+        conn = self._require_conn()
+        cur = await conn.execute(
+            "SELECT * FROM lag_events WHERE ts >= ? ORDER BY ts", (since_ts,)
+        )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]

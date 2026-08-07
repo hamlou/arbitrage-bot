@@ -7,7 +7,7 @@ close_position_early(), and min-order-size/tick-size enforcement.
 import pytest
 
 from data.polymarket_feed import Market, OrderBook, OrderBookLevel
-from engine.broker_paper import OrderTooSmallError, PaperBroker
+from engine.broker_paper import OrderTooSmallError, PaperBroker, SumToOneEdgeLostError
 from engine.sum_to_one import find_sum_to_one_opportunity
 from storage.db import Database
 
@@ -222,6 +222,71 @@ async def test_place_sum_to_one_order_buys_both_legs(db):
     combo_ids = {t["combo_group_id"] for t in open_trades}
     assert len(combo_ids) == 1
     assert None not in combo_ids
+
+
+async def test_sum_to_one_reverses_when_edge_evaporates_at_fill(db):
+    """
+    Regression test for the 2026-08-07 loss: the opportunity was detected
+    against best asks (< $1 combined), but the fills land after the simulated
+    fill latency against a book that kept moving — the combined fill cost can
+    be >= $1 (verified live: 0.31+0.73=1.04, 0.17+0.89=1.06). When that
+    happens the "arbitrage" is a guaranteed loss, so BOTH legs must be
+    reversed immediately and SumToOneEdgeLostError raised — never held to
+    settlement as a losing "guaranteed win".
+    """
+    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+             "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    feed = FakeFeed(books)
+    market = make_market()
+
+    # 0.3s simulated latency between decision and fill, during which the book
+    # drifts so combined cost crosses $1.
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
+                         simulated_fill_latency_s=0.3)
+
+    opp = find_sum_to_one_opportunity(
+        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.0,
+    )
+    assert opp is not None  # detected as a genuine < $1 opportunity
+
+    # The book moves before the fills land: YES ask 0.46 -> 0.52, NO 0.48 -> 0.50
+    # (combined 1.02 >= 1.00 — edge gone).
+    def moving_book(token_id: str):
+        if token_id == "tok_yes":
+            return make_symmetric_book(token_id, best_ask=0.52)
+        return make_symmetric_book(token_id, best_ask=0.50)
+
+    async def fetch(_, token_id: str):
+        return moving_book(token_id)
+
+    import types
+    broker.feed = types.SimpleNamespace(get_order_book=fetch, get_market_outcome=feed.get_market_outcome)
+
+    with pytest.raises(SumToOneEdgeLostError):
+        await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    # Both legs must have been reversed — no open positions remain.
+    assert not broker.has_open_position("m1")
+    open_trades = await db.get_open_trades(mode="PAPER")
+    assert open_trades == []
+
+
+async def test_sum_to_one_held_when_edge_survives_fill(db):
+    """When the fills land at or below the decision-time cost, the combo is
+    held as a genuine arbitrage (both legs open, same combo_group_id)."""
+    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+             "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    market = make_market()
+    broker = PaperBroker(db=db, feed=FakeFeed(books), starting_balance_usd=1000, fee_pct=0.0,
+                         simulated_fill_latency_s=0.3)
+
+    opp = find_sum_to_one_opportunity(market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.0)
+    yes_fill, no_fill = await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    assert yes_fill.avg_price + no_fill.avg_price < 1.0
+    open_trades = await db.get_open_trades(mode="PAPER")
+    assert len(open_trades) == 2
+    assert len({t["combo_group_id"] for t in open_trades}) == 1  # same combo
 
 
 async def test_sum_to_one_settlement_guarantees_profit_regardless_of_outcome(db):

@@ -25,9 +25,10 @@ from data.coinbase_feed import CoinbaseFeed
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed
 from data.polymarket_ws_feed import PolymarketWSFeed
 from engine.broker_live import LiveBroker, LiveTradingNotEnabledError, build_live_broker
-from engine.broker_paper import PaperBroker
+from engine.broker_paper import PaperBroker, SumToOneEdgeLostError
 from engine.calibration import load_calibration
 from engine.feed_health import FeedHealth
+from engine.lag_tracker import LagMeasurement, LagTracker
 from engine.latency import LatencyTracker
 from engine.risk import RiskManager, SignalForSizing
 from engine.signal import SignalEngine
@@ -163,6 +164,17 @@ class TradingApp:
         self._fast_path_rerun = False
         self._fast_path_last_update: Optional[PriceUpdate] = None
 
+        # Empirical arbitrage-window measurement (pure diagnostics, never
+        # gates trading): measures how long Polymarket takes to reprice after
+        # a Binance move — the number ASSUMED_ARBITRAGE_WINDOW_S guesses at.
+        self.lag_tracker = LagTracker(
+            min_reprice_move=settings.LAG_REPRICE_MIN_MOVE,
+            timeout_s=settings.LAG_TRACK_TIMEOUT_S,
+        )
+        # Previous ingested price per symbol — the per-tick move that the lag
+        # tracker watches (independent of the fast path's cumulative trigger).
+        self._last_ingest_price: dict[str, float] = {}
+
         # market_id -> Market, maintained by _market_discovery_loop, read (not
         # re-fetched) by the hot per-second trading cycle. This is what fixes
         # the "Gamma called every single second" inefficiency — discovery now
@@ -218,12 +230,95 @@ class TradingApp:
         async for update in self.binance_feed.stream():
             self.signal_engine.ingest_price_update(update, source="binance")
             self.feed_health.record_message("binance")
+            self._record_lag_moves(update)
             if self._shutdown.is_set():
                 return
             try:
                 await self._maybe_fast_path(update)
             except Exception:
                 logger.exception("Fast-path trigger failed for %s", update.symbol)
+
+    # -- Lag-gap measurement (instrumentation — never gates trading) ----------
+
+    def _record_lag_moves(self, update: PriceUpdate) -> None:
+        """
+        Feed the lag tracker: when a Binance tick moves >= LAG_TRACK_MOVE_MIN_PCT
+        from the previous tick for that symbol, start measuring how long the
+        direction-implied Polymarket token of the most-liquid market for this
+        asset takes to reprice. Pure diagnostics; best-effort.
+        """
+        try:
+            last = self._last_ingest_price.get(update.symbol)
+            self._last_ingest_price[update.symbol] = update.price
+            if last is None or last <= 0:
+                return
+            move = (update.price - last) / last
+            if abs(move) < settings.LAG_TRACK_MOVE_MIN_PCT:
+                return
+            asset = update.symbol[:-4] if update.symbol.endswith("USDT") else update.symbol
+            market = self._most_liquid_market_for(asset)
+            if market is None:
+                return
+            token_id = market.token_id_yes if move > 0 else market.token_id_no
+            if not self.ws_feed.is_fresh(token_id):
+                return
+            book = self.ws_feed.get_cached_book(token_id)
+            if book is None or book.mid is None:
+                return
+            self.lag_tracker.on_move(
+                asset=asset, move_pct=abs(move),
+                move_dir="UP" if move > 0 else "DOWN",
+                token_id=token_id, baseline_mid=book.mid,
+                ts=update.received_at,
+            )
+        except Exception:
+            logger.debug("Lag tracking skipped for %s", update.symbol, exc_info=True)
+
+    def _most_liquid_market_for(self, asset: str) -> Optional[Market]:
+        """The known market for `asset` with the deepest liquidity — the one
+        the bot would actually trade, so the lag measured is the tradable
+        lag, not an illiquid side market."""
+        candidates = [m for m in self._known_markets.values() if m.asset == asset]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.liquidity_usd or 0.0)
+
+    async def _lag_tracker_loop(self) -> None:
+        """
+        Every LAG_TRACK_INTERVAL_S, scan the lag tracker's pending moves
+        against the live WS books and persist finalized measurements (both
+        repriced and timed-out) to the lag_events table. Independent of
+        trading — a slow write must never stall a cycle.
+        """
+        while not self._shutdown.is_set():
+            try:
+                await self._lag_tracker_pass()
+            except Exception:
+                logger.exception("Lag tracker pass failed")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=settings.LAG_TRACK_INTERVAL_S)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _lag_tracker_pass(self) -> None:
+        now = time.time()
+        for token_id in self.lag_tracker.pending_token_ids():
+            if not self.ws_feed.is_fresh(token_id):
+                continue
+            book = self.ws_feed.get_cached_book(token_id)
+            if book is None or book.mid is None:
+                continue
+            measurement = self.lag_tracker.observe(token_id=token_id, mid=book.mid, ts=now)
+            if measurement is not None:
+                await self._persist_lag(measurement)
+        for measurement in self.lag_tracker.sweep(ts=now):
+            await self._persist_lag(measurement)
+
+    async def _persist_lag(self, measurement: LagMeasurement) -> None:
+        try:
+            await self.db.log_lag_event(**measurement.to_db_row())
+        except Exception:
+            logger.exception("Failed to persist lag measurement for %s", measurement.asset)
 
     async def _coinbase_ingest_loop(self) -> None:
         """Coinbase ticks feed ONLY the cross-exchange sanity gate (they are
@@ -253,11 +348,37 @@ class TradingApp:
                     if existing is not None and existing.reference_price is not None:
                         m = m.with_reference_price(existing.reference_price)
                     elif m.market_id not in self._known_markets:
-                        ref_price = self.signal_engine.current_price(m.asset)
-                        if ref_price is not None:
-                            m = m.with_reference_price(ref_price)
+                        # Reference-price trust guard (verified 2026-08-07):
+                        # the fair-value model needs the price at the market's
+                        # OPEN. If discovery first sees a market late in its
+                        # window (bot restarted mid-contract, or Gamma served
+                        # it late), the Binance price now is NOT the open
+                        # price — using it as the reference makes the model
+                        # confidently wrong in direction (836 saturated reads
+                        # like "model 2% vs market 99.5%" in one run). Only
+                        # trust a first-sighting reference when the window is
+                        # still mostly ahead of us.
+                        remaining = m.time_remaining_s
+                        duration_s = (m.duration_minutes or 15) * 60
+                        if (
+                            remaining is not None
+                            and remaining < duration_s * settings.REFERENCE_TRUST_MIN_REMAINING_PCT
+                        ):
+                            # Leave reference_price unset -> fair-value stays
+                            # off; the calibrated momentum fallback (honestly
+                            # ~52%) will refuse to invent an edge on stale
+                            # inputs, so no phantom trade fires.
+                            logger.debug(
+                                "Late first sighting of %s (%.0fs of %ds left) — "
+                                "reference price not trusted, fair-value stays off",
+                                m.market_id, remaining, duration_s,
+                            )
                         else:
-                            logger.debug("No Binance price yet to use as reference for new market %s", m.market_id)
+                            ref_price = self.signal_engine.current_price(m.asset)
+                            if ref_price is not None:
+                                m = m.with_reference_price(ref_price)
+                            else:
+                                logger.debug("No Binance price yet to use as reference for new market %s", m.market_id)
                     self._known_markets[m.market_id] = m
 
                 active_ids = {m.market_id for m in markets}
@@ -533,6 +654,12 @@ class TradingApp:
                                     f"locked edge {sto_opportunity.net_profit_pct:.2%})",
                                     level=AlertLevel.INFO,
                                 )
+                            except SumToOneEdgeLostError as e:
+                                # The combo edge vanished between detection and
+                                # fill; both legs were already reversed by the
+                                # broker. This is a normal market condition, not
+                                # a bug — log at INFO, never alert.
+                                logger.info("Sum-to-one %s skipped: %s", market.market_id, e)
                             except Exception:
                                 logger.exception("Sum-to-one order failed for market %s", market.market_id)
                         await self.latency.finish(cycle, fired=True)
@@ -557,6 +684,13 @@ class TradingApp:
 
                 try:
                     kwargs = {"book_source": book_source} if book_source is not None else {}
+                    if book_source is not None:
+                        # Analysis label only (no behavior change): mark
+                        # event-driven fast-path entries so the validation run
+                        # can split PnL / win rate by entry path. book_source
+                        # is only ever set on the fast path, and only for
+                        # PaperBroker (LiveBroker gets book_source_arg=None).
+                        kwargs["strategy"] = "latency_arb_fast"
                     fill = await self.broker.place_order(market, signal.side, size_usd, **kwargs)
                     cycle.mark_order_submitted()
                     await self.alerter.send_alert(
@@ -701,6 +835,16 @@ class TradingApp:
 
         open_trades = await self.db.get_open_trades(mode="PAPER")
         for t in open_trades:
+            # Sum-to-one legs are outcome-agnostic by construction (we hold
+            # BOTH sides to settlement; whichever wins pays $1, and the combo
+            # locked a profit below that). The directional model's opinion is
+            # meaningless for them, so TAKE_PROFIT / EDGE_REVERSAL must NEVER
+            # fire on a sum_to_one leg — exiting one leg early breaks the
+            # hedge. Verified 2026-08-07: the model "reversed" the NO leg of
+            # an ETH combo and sold it at 0.854 when holding to settlement
+            # would have paid 1.0 — turning a guaranteed win into a loss.
+            if (t.get("strategy") or "latency_arb") == "sum_to_one":
+                continue
             market = self._known_markets.get(t["market_id"])
             if market is None or not t["entry_price"]:
                 continue
@@ -916,8 +1060,26 @@ class TradingApp:
         latency = await self._build_latency_summary()
         config = self._build_config_summary()
 
+        # Empirical Polymarket repricing lag (measured, not assumed). Empty
+        # until the lag tracker has collected a few moves.
+        lag = {}
+        try:
+            lag_events = await self.db.get_lag_events()
+            if lag_events:
+                lags = sorted(e["lag_ms"] for e in lag_events if e.get("lag_ms") is not None)
+                if lags:
+                    lag = {
+                        "measured": len(lags),
+                        "timed_out": sum(1 for e in lag_events if e.get("timed_out")),
+                        "lag_p50_ms": lags[len(lags) // 2],
+                        "lag_p95_ms": lags[min(len(lags) - 1, int(len(lags) * 0.95))],
+                    }
+        except Exception:
+            logger.exception("Status snapshot: could not read lag events")
+
         return {
             "mode": mode,
+            "lag": lag,
             "stats_note": stats_note,
             "balance_usd": balance_usd,
             "equity_usd": equity_usd,
@@ -1187,6 +1349,7 @@ class TradingApp:
             asyncio.create_task(self._trading_loop(), name="trading_loop"),
             asyncio.create_task(run_dashboard(self._get_dashboard_state), name="dashboard"),
             asyncio.create_task(self._command_center_state_loop(), name="command_center_state"),
+            asyncio.create_task(self._lag_tracker_loop(), name="lag_tracker"),
         ]
         if self.telegram_reporter.enabled:
             tasks.append(asyncio.create_task(self._telegram_status_loop(), name="telegram_status"))

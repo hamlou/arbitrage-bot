@@ -26,13 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYTHON = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MAIN = REPO_ROOT / "main.py"
 LOG = REPO_ROOT / "storage" / "paper_run.log"
-LAUNCHER = REPO_ROOT / "scripts" / "start_paper_bot.cmd"
-
-# The task runs a tiny batch launcher (scripts/start_paper_bot.cmd) rather
-# than an inline command: schtasks /tr with quotes, &&, parentheses in the
-# path, and redirection fails with a generic COM error (0x80004005). A .cmd
-# file avoids every quoting edge case and is also handy for manual restarts.
-
+# Task Scheduler launches the action via CreateProcess, which cannot execute
+# a .cmd/.bat directly (the task silently does nothing). The action is
+# therefore powershell.exe running a .ps1 that cd's to the repo and starts
+# the bot detached. See scripts/launch_bot.ps1.
+LAUNCHER = REPO_ROOT / "scripts" / "launch_bot.ps1"
 
 def _run(args: list[str]) -> None:
     subprocess.run(args, check=True, capture_output=True, text=True)
@@ -42,13 +40,16 @@ def create_and_start(task_name: str) -> None:
     # /f overwrites any stale task with the same name; /sc once + /st midnight
     # then /run triggers it immediately. /RL LIMITED keeps it out of admin
     # territory — the bot needs no privileges.
-    # The repo path contains spaces ("polymarket-arb-bot (1)"), so the task
-    # command line MUST be quoted — an unquoted /tr makes Task Scheduler split
-    # on the space and fail with ERROR_FILE_NOT_FOUND (0x80070002).
-    quoted = f'"{LAUNCHER}"'
+    # The repo path contains spaces ("polymarket-arb-bot (1)"), so the -File
+    # argument MUST be quoted — an unquoted /tr makes Task Scheduler split on
+    # the space and fail with ERROR_FILE_NOT_FOUND (0x80070002).
+    action = (
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+        f'-File "{LAUNCHER}"'
+    )
     _run([
         "schtasks", "/create", "/tn", task_name,
-        "/tr", quoted,
+        "/tr", action,
         "/sc", "once", "/st", "23:59",
         "/rl", "LIMITED", "/f",
     ])

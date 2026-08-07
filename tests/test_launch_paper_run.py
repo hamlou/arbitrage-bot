@@ -29,9 +29,13 @@ def test_create_and_start_quotes_task_command(tmp_path):
     assert len(create_args) == 1
     tr_idx = create_args[0].index("/tr")
     task_cmd = create_args[0][tr_idx + 1]
-    # Quoted, and pointing at the batch launcher inside this repo.
-    assert task_cmd.startswith('"') and task_cmd.endswith('"')
-    assert "start_paper_bot.cmd" in task_cmd
+    # Task Scheduler launches via CreateProcess, which cannot run a .cmd
+    # directly, so the action is powershell.exe -File "...launch_bot.ps1".
+    # The -File argument MUST be quoted — the repo path contains a space
+    # ("polymarket-arb-bot (1)") and an unquoted path splits and fails with
+    # ERROR_FILE_NOT_FOUND. Lock in that contract.
+    assert task_cmd.startswith("powershell.exe")
+    assert '-File "' in task_cmd and 'launch_bot.ps1"' in task_cmd
 
     run_args = [c for c in calls if c[1] == "/run"]
     assert len(run_args) == 1

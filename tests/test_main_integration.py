@@ -6,6 +6,7 @@ fair-value model, order placement, restart recovery, and the settlement fix
 discovery list that caused the original dead-code bug).
 """
 import asyncio
+import dataclasses
 import logging
 import time
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from data.binance_feed import PriceUpdate
 from data.polymarket_feed import Market, OrderBook, OrderBookLevel
 import engine.feed_health as feed_health_module
 from engine.broker_live import LiveBroker
+from engine.sum_to_one import find_sum_to_one_opportunity
 from main import TradingApp
 import config.settings as settings_module
 
@@ -97,6 +99,99 @@ async def build_app(app_settings) -> TradingApp:
     app.feed = FakePolymarketFeed()
     await app.setup()
     return app
+
+
+async def test_late_first_sighting_does_not_trust_reference_price(app_settings, caplog):
+    """
+    Regression test for the reference-price trust guard (verified 2026-08-07:
+    836 saturated reads like "model 2% vs market 99.5%" in one run). When a
+    market is first seen well INTO its window, the Binance price at that
+    moment is NOT the open price — using it as the fair-value reference makes
+    the model confidently wrong in direction. Discovery must leave
+    reference_price unset for such markets so the fair-value model stays off.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        # A fresh Binance tick so current_price() is available to discovery.
+        app.signal_engine.ingest_price_update(
+            PriceUpdate(symbol="BTCUSDT", price=65000.0, event_time_ms=0, received_at=time.time(), kind="trade")
+        )
+
+        # 15-min market, only 2 minutes left when discovery first sees it —
+        # 13% remaining < 60% trust threshold -> reference must NOT be set.
+        late_market = dataclasses.replace(
+            make_market(market_id="late_mkt", reference_price=None),
+            expires_at_ts=time.time() + 120,
+        )
+        app.feed.register(
+            late_market,
+            make_book(late_market.token_id_yes, 0.49, 0.51),
+            make_book(late_market.token_id_no, 0.49, 0.51),
+        )
+
+        # The loop runs forever; instead of waiting, patch sleep so the loop
+        # exits after one discovery pass (StopAsyncIteration propagates out).
+        async def stop_after_one(*args, **kwargs):
+            raise StopAsyncIteration
+
+        original_sleep = asyncio.sleep
+        asyncio.sleep = stop_after_one  # type: ignore[assignment]
+        try:
+            with caplog.at_level(logging.DEBUG, logger="main"):
+                try:
+                    await app._market_discovery_loop()
+                except StopAsyncIteration:
+                    pass
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        known = app._known_markets.get("late_mkt")
+        assert known is not None
+        assert known.reference_price is None  # guard worked: no trusted reference
+        assert "reference price not trusted" in caplog.text
+    finally:
+        await app.db.close()
+
+
+async def test_early_first_sighting_does_trust_reference_price(app_settings):
+    """A market first seen near its open (most of the window remaining) gets a
+    trusted reference price, so the fair-value model can run normally."""
+    app = await build_app(app_settings)
+    try:
+        app.signal_engine.ingest_price_update(
+            PriceUpdate(symbol="BTCUSDT", price=65000.0, event_time_ms=0, received_at=time.time(), kind="trade")
+        )
+
+        early_market = dataclasses.replace(
+            make_market(market_id="early_mkt", reference_price=None),
+            expires_at_ts=time.time() + 12 * 60,  # 12 of 15 min left: 80% >= 60%
+        )
+        app.feed.register(
+            early_market,
+            make_book(early_market.token_id_yes, 0.49, 0.51),
+            make_book(early_market.token_id_no, 0.49, 0.51),
+        )
+
+        async def stop_after_one(*args, **kwargs):
+            raise StopAsyncIteration
+
+        original_sleep = asyncio.sleep
+        asyncio.sleep = stop_after_one  # type: ignore[assignment]
+        try:
+            try:
+                await app._market_discovery_loop()
+            except StopAsyncIteration:
+                pass
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        known = app._known_markets.get("early_mkt")
+        assert known is not None
+        assert known.reference_price == 65000.0  # trusted: captured from Binance
+    finally:
+        await app.db.close()
 
 
 async def test_full_pipeline_places_a_trade_on_a_clear_edge(app_settings):
@@ -254,6 +349,53 @@ async def test_trading_cycle_skips_when_reconnect_storm(app_settings, caplog):
 
         assert "feed_unhealthy" in caplog.text
         assert await app.db.get_open_trades(mode="PAPER") == []
+    finally:
+        await app.db.close()
+
+
+async def test_early_exit_skips_sum_to_one_legs(app_settings):
+    """
+    Regression test for the 2026-08-07 sum-to-one loss: the directional
+    model's EDGE_REVERSAL exit fired on a sum_to_one leg and sold it at
+    0.854 when holding to settlement would have paid 1.0 — breaking the
+    outcome-agnostic hedge. Sum-to-one legs must never be subject to
+    directional TAKE_PROFIT / EDGE_REVERSAL exits; they are held to
+    settlement by construction.
+    """
+    app = await build_app(app_settings)
+    try:
+        now = time.time()
+        # Feed the model a strong DOWN move so it reads NO with a big edge
+        # (making EDGE_REVERSAL plausible on any YES-position).
+        for i, price in enumerate([65000, 64800, 64600, 64400, 64200, 64000, 63800, 63600, 63400, 63200]):
+            app.signal_engine.ingest_price_update(
+                PriceUpdate(symbol="BTCUSDT", price=price, event_time_ms=0, received_at=now + i, kind="trade")
+            )
+
+        market = make_market(reference_price=65000)
+        # Books summing below $1 (0.46+0.48=0.94) so a genuine sum-to-one
+        # opportunity exists, independent of the directional signal.
+        yes_book = make_book(market.token_id_yes, 0.44, 0.46)
+        no_book = make_book(market.token_id_no, 0.46, 0.48)
+        app.feed.register(market, yes_book, no_book)
+        app._known_markets[market.market_id] = market
+
+        # Open a sum-to-one pair manually (broker-level, bypassing the signal
+        # gate, exactly as _evaluate_and_maybe_trade would after detection).
+        opp = find_sum_to_one_opportunity(
+            market, yes_book, no_book,
+            settings_module.settings.SUM_TO_ONE_MIN_EDGE_PCT,
+            settings_module.settings.TAKER_FEE_PCT,
+        )
+        assert opp is not None
+        await app.broker.place_sum_to_one_order(opp, total_size_usd=100)
+        assert len(await app.db.get_open_trades(mode="PAPER")) == 2
+
+        # The model now reads NO vs a held YES leg with a big edge — but the
+        # sum-to-one legs must NOT be exited regardless.
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 2  # both legs still held
     finally:
         await app.db.close()
 

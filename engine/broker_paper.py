@@ -42,6 +42,27 @@ class OrderTooSmallError(Exception):
     pass
 
 
+class SumToOneEdgeLostError(Exception):
+    """
+    Raised by place_sum_to_one_order when the combined fill price of the two
+    legs no longer locks a profit. The opportunity was detected against
+    best asks at decision time, but the fills include the simulated fill
+    latency and real book walking — and by the time both legs land, the
+    combined cost can be at or above $1 (verified 2026-08-07: fills at
+    0.31+0.73=1.04 and 0.17+0.89=1.06 — a guaranteed LOSS, not an arb). The
+    broker reverses both legs before raising, so a "guaranteed" pair is
+    never held as a guaranteed loss.
+    """
+
+    def __init__(self, combined_cost: float, locked_edge_pct: float):
+        super().__init__(
+            f"Sum-to-one edge evaporated at fill: combined cost {combined_cost:.3f} "
+            f"(locked edge {locked_edge_pct:.2%}) — both legs reversed"
+        )
+        self.combined_cost = combined_cost
+        self.locked_edge_pct = locked_edge_pct
+
+
 def _round_to_tick(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
@@ -269,12 +290,14 @@ class PaperBroker:
 
         book_at_decision = await _current_book()
         mid_before = book_at_decision.mid
+        decision_ask = book_at_decision.best_ask
 
         if self.simulated_fill_latency_s > 0:
             await asyncio.sleep(self.simulated_fill_latency_s)
             book = await _current_book()
         else:
             book = book_at_decision
+        fill_ask = book.best_ask
 
         avg_price, shares = self._walk_book_for_fill(book, size_usd)
         avg_price = _round_to_tick(avg_price, self.tick_size)
@@ -288,6 +311,11 @@ class PaperBroker:
 
         self.balance_usd -= total_cost
 
+        # Fill-realism measurement (verified 2026-08-07): the paper broker
+        # computes slippage on every fill but previously threw it away — so
+        # the most useful paper-mode metric (how much edge is lost between
+        # decision and fill) was unanswerable. Persist slippage + the
+        # decision-time and fill-time best asks so edge decay is measurable.
         slippage_pct = 0.0
         if mid_before:
             slippage_pct = (avg_price - mid_before) / mid_before
@@ -303,6 +331,9 @@ class PaperBroker:
             fee_usd=fee_usd,
             strategy=strategy,
             combo_group_id=combo_group_id,
+            slippage_pct=slippage_pct,
+            decision_best_ask=decision_ask,
+            fill_best_ask=fill_ask,
         )
         self._open_positions.setdefault(market.market_id, []).append(trade_id)
         await self.db.record_equity(mode=self.mode, balance_usd=self.balance_usd)
@@ -346,6 +377,38 @@ class PaperBroker:
             opportunity.market, "NO", half, strategy="sum_to_one", combo_group_id=combo_group_id,
             book_source=book_source,
         )
+
+        # Re-validate the locked edge from the ACTUAL fills, not the
+        # decision-time best asks. The opportunity was detected against best
+        # asks, but each leg fills after the simulated fill latency against a
+        # book that has kept moving, and the fill walks the ask side — so the
+        # combined cost can drift above $1 before both legs land. Verified
+        # 2026-08-07: fills landed at 0.31+0.73=1.04 and 0.17+0.89=1.06 (a
+        # guaranteed loss), yet the decision-time edge check had passed.
+        combined_cost = yes_fill.avg_price + no_fill.avg_price
+        fee_cost = self.fee_pct * combined_cost
+        locked_edge_pct = (1.0 - combined_cost) - fee_cost
+        if locked_edge_pct <= 0:
+            # The "arbitrage" is gone — reverse both legs immediately at the
+            # current book so we never hold a guaranteed-losing pair to
+            # settlement. The realized loss here is just the spread cost of
+            # the failed attempt, which is exactly what paper mode should
+            # surface. Best-effort: if a leg can't be exited (no bid depth),
+            # it stays open and settlement will resolve it normally.
+            logger.warning(
+                "Sum-to-one edge evaporated at fill: combined %.3f (locked %.2f%%) "
+                "— reversing both legs of combo %s",
+                combined_cost, locked_edge_pct * 100, combo_group_id,
+            )
+            for fill in (yes_fill, no_fill):
+                try:
+                    await self.close_position_early(
+                        opportunity.market, fill.trade_id, reason="SUM_TO_ONE_EDGE_LOST",
+                    )
+                except Exception:
+                    logger.exception("Failed to reverse sum-to-one leg %d after edge loss", fill.trade_id)
+            raise SumToOneEdgeLostError(combined_cost, locked_edge_pct)
+
         return yes_fill, no_fill
 
     async def cancel_order(self, order_id: str) -> bool:

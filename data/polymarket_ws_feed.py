@@ -45,6 +45,17 @@ def _parse_levels(raw_levels: list[dict]) -> tuple[OrderBookLevel, ...]:
     )
 
 
+def _close_code_and_reason(exc: "websockets.exceptions.ConnectionClosed"):
+    """Best-effort close code/reason from a ConnectionClosed, via the rcvd/sent
+    frames (the .code/.reason properties are deprecated in websockets >= 13).
+    Returns (code, reason) where either may be None."""
+    for attr in ("rcvd", "sent"):
+        frame = getattr(exc, attr, None)
+        if frame is not None:
+            return getattr(frame, "code", None), getattr(frame, "reason", None)
+    return None, None
+
+
 class PolymarketWSFeed:
     """
     Subscribes to a set of token IDs and maintains an in-memory, continuously
@@ -229,8 +240,25 @@ class PolymarketWSFeed:
                         for event in events:
                             if isinstance(event, dict):
                                 self._handle_event(event)
-            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException, OSError):
-                logger.warning("Polymarket WS connection dropped, reconnecting")
+            except websockets.exceptions.ConnectionClosed as exc:
+                # Log WHY it dropped — the close code separates ISP-level
+                # flapping (1006 abnormal closure / ping timeouts) from
+                # server-side closes (1000/1001), so reconnect storms are
+                # diagnosable instead of just visible as a count. Access via
+                # the rcvd/sent frames (the .code/.reason properties are
+                # deprecated in websockets >= 13).
+                code, reason = _close_code_and_reason(exc)
+                logger.warning(
+                    "Polymarket WS connection dropped: code=%s reason=%r — reconnecting",
+                    code, reason,
+                )
+                self._connected.clear()
+                if self.on_reconnect is not None:
+                    self.on_reconnect()
+                await asyncio.sleep(1)
+                continue
+            except (websockets.exceptions.WebSocketException, OSError) as exc:
+                logger.warning("Polymarket WS connection dropped: %r — reconnecting", exc)
                 self._connected.clear()
                 if self.on_reconnect is not None:
                     self.on_reconnect()

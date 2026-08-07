@@ -90,6 +90,25 @@ async def test_place_order_deducts_fee_from_balance(db):
     assert broker.balance_usd == pytest.approx(1000 - 102)
 
 
+async def test_place_order_persists_fill_realism_metrics(db):
+    """Slippage + decision/fill best asks must be stored on the trade row —
+    the paper-mode 'how much edge did we lose between deciding and filling'
+    metric. Verified 2026-08-07: the broker computed these and threw them
+    away, so the metric was unanswerable from the DB."""
+    feed = FakeFeed(make_book())
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+
+    fill = await broker.place_order(make_market(), "YES", size_usd=100)
+
+    trades = await db.get_all_trades(mode="PAPER")
+    assert len(trades) == 1
+    t = trades[0]
+    assert t["decision_best_ask"] == pytest.approx(0.56)
+    assert t["fill_best_ask"] == pytest.approx(0.56)
+    assert t["slippage_pct"] == pytest.approx(fill.slippage_pct)
+    assert fill.slippage_pct > 0  # walking the book into 0.58 must cost something
+
+
 async def test_insufficient_depth_raises_value_error(db):
     thin_book = OrderBook(
         market_id="m1", token_id="tok_yes",
@@ -131,6 +150,35 @@ async def test_settle_position_loses_pays_out_zero(db):
 
 
 # -- cancel stubs (interface parity with LiveBroker) -------------------------
+
+
+async def test_existing_db_migrates_new_fill_columns(tmp_path):
+    """A DB created before the fill-realism columns existed must get them via
+    the column migration on connect — otherwise open_trade's new 3-column
+    INSERT would throw on the running bot's existing DB at the worst moment
+    (a restart). Reviewed 2026-08-07: only the fresh-DB path was covered."""
+    path = tmp_path / "old.db"
+    db = Database(str(path))
+    await db.connect()
+    # Simulate an old-schema DB: drop the columns schema.sql now creates.
+    await db._conn.execute("ALTER TABLE trades DROP COLUMN slippage_pct")
+    await db._conn.execute("ALTER TABLE trades DROP COLUMN decision_best_ask")
+    await db._conn.execute("ALTER TABLE trades DROP COLUMN fill_best_ask")
+    await db._conn.commit()
+    await db.close()
+
+    db2 = Database(str(path))
+    await db2.connect()  # _migrate_missing_columns must re-add the columns
+    trade_id = await db2.open_trade(
+        signal_id=None, market_id="m1", asset="BTC", side="YES", mode="PAPER",
+        entry_price=0.55, size_usd=100, fee_usd=2.0,
+        slippage_pct=0.01, decision_best_ask=0.56, fill_best_ask=0.57,
+    )
+    assert trade_id > 0
+    trades = await db2.get_all_trades(mode="PAPER")
+    assert trades[0]["slippage_pct"] == pytest.approx(0.01)
+    assert trades[0]["decision_best_ask"] == pytest.approx(0.56)
+    await db2.close()
 
 
 async def test_cancel_order_stub_returns_true(db):

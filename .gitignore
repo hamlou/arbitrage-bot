@@ -6,6 +6,11 @@ storage/*.db-wal
 storage/*.db-journal
 storage/*.log
 *.log
+# Archived DBs from debug/pre-run snapshots — raw trade data, never pushed
+storage/archive/
+# Recorded market-data captures for scripts/replay_arb.py — raw data, can be
+# large, and can be re-recorded any time.
+storage/captures/
 exports/
 __pycache__/
 *.pyc

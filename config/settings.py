@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     FRESH_MOVE_LOOKBACK_S: float = 15.0
     FRESH_MOVE_MIN_PCT: float = 0.0006   # 0.06% in 15s, aligned with the model
     MIN_ENTRY_TIME_REMAINING_S: float = 45.0
+    # Reference-price trust guard for the fair-value model (verified
+    # 2026-08-07): the reference price is captured at FIRST SIGHTING of a
+    # market. If discovery catches a market late (bot restart mid-contract,
+    # or Gamma serving it late), the "reference" is really the CURRENT price
+    # — so the fair-value z-score compares price-to-itself and points the
+    # WRONG way, producing saturated reads like "model 2% vs market 99.5%"
+    # (836 such blocked signals in one run). Only trust a first-sighting
+    # reference when at least this fraction of the window remains at capture;
+    # otherwise leave reference_price unset so fair-value stays off and the
+    # calibrated momentum fallback (honestly ~52%) refuses to invent an edge.
+    REFERENCE_TRUST_MIN_REMAINING_PCT: float = 0.60
 
     # --- Exit logic -----------------------------------------------------
     # Early take-profit: exit if the position's current mark-to-market value
@@ -158,6 +169,18 @@ class Settings(BaseSettings):
     # evaluations per asset.
     FAST_PATH_MOVE_TRIGGER_PCT: float = 0.0010   # 0.10% move since last fast eval triggers one
     FAST_PATH_COOLDOWN_S: float = 0.5
+
+    # --- Lag-gap measurement (instrumentation — never gates trading) -----------
+    # Measures the bot's ACTUAL arbitrage window on this connection instead of
+    # assuming it: LAG_TRACK_MOVE_MIN_PCT is the Binance move size that starts
+    # a measurement, LAG_REPRICE_MIN_MOVE is how far the Polymarket token's
+    # mid must move for the market to count as "repriced", and
+    # LAG_TRACK_TIMEOUT_S is how long to wait before recording the market as a
+    # laggard (timed_out). Purely diagnostic — no trade decision reads these.
+    LAG_TRACK_MOVE_MIN_PCT: float = 0.0010   # 0.10% move triggers a lag measurement
+    LAG_REPRICE_MIN_MOVE: float = 0.005      # absolute mid move (0.5c) counts as repriced
+    LAG_TRACK_TIMEOUT_S: float = 30.0        # give the market this long to reprice
+    LAG_TRACK_INTERVAL_S: float = 0.2        # how often the tracker loop scans
 
     # --- Latency / timing budget ---------------------------------------------
     # The realistic arbitrage window for Polymarket's short-duration crypto

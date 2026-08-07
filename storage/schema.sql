@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_price     REAL    NOT NULL,
     size_usd        REAL    NOT NULL,
     fee_usd         REAL    NOT NULL DEFAULT 0,
+    slippage_pct    REAL,                      -- (avg_fill - mid_at_decision) / mid_at_decision
+    decision_best_ask REAL,                    -- best ask at decision time (edge-decay measurement)
+    fill_best_ask   REAL,                      -- best ask at fill time (edge-decay measurement)
     exit_ts         REAL,
     exit_price      REAL,
     exit_reason     TEXT,                      -- SETTLED / MANUAL_EXIT / TAKE_PROFIT / EDGE_REVERSAL / ...
@@ -90,3 +93,25 @@ CREATE TABLE IF NOT EXISTS exchange_disagreements (
     disagreement_pct REAL    NOT NULL           -- |coinbase - binance| / binance * 100
 );
 CREATE INDEX IF NOT EXISTS idx_exchange_disagreements_ts ON exchange_disagreements(ts);
+
+-- Empirical arbitrage-window measurement: for every Binance move above
+-- LAG_TRACK_MOVE_MIN_PCT, how long did Polymarket take to reprice the
+-- direction-implied token (if it repriced at all). Filled by
+-- engine/lag_tracker.py via main.py's _lag_tracker_loop. This is the
+-- measured lag on THIS connection — the number ASSUMED_ARBITRAGE_WINDOW_S
+-- currently guesses at.
+CREATE TABLE IF NOT EXISTS lag_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               REAL    NOT NULL,          -- when the measurement was recorded
+    asset            TEXT    NOT NULL,          -- BTC / ETH
+    move_pct         REAL    NOT NULL,          -- |Binance move| that triggered (fraction)
+    move_dir         TEXT    NOT NULL,          -- UP / DOWN (direction of the Binance move)
+    token_id         TEXT    NOT NULL,          -- the direction-implied token that should reprice
+    binance_move_ts  REAL    NOT NULL,          -- when the Binance move was received locally
+    baseline_mid     REAL,                      -- implied token mid at move time
+    poly_repriced_ts REAL,                      -- when the mid first moved >= LAG_REPRICE_MIN_MOVE
+    poly_move_pct    REAL,                      -- actual mid change at detection (can be negative)
+    lag_ms           REAL,                      -- (poly_repriced_ts - binance_move_ts) * 1000; NULL if timed out
+    timed_out        INTEGER NOT NULL DEFAULT 0 -- 1 = never repriced within LAG_TRACK_TIMEOUT_S
+);
+CREATE INDEX IF NOT EXISTS idx_lag_events_ts ON lag_events(ts);

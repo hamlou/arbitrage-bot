@@ -109,6 +109,40 @@ def test_reconnect_count_prunes_older_entries(health, clock):
     assert health.reconnect_count("binance") == 1
 
 
+def test_spread_out_reconnects_not_a_storm(health, clock):
+    """Reconnects spread minutes apart must NOT make a currently-fresh feed
+    unhealthy — the old 10-minute-window gate halted trading for bursts that
+    had already recovered even while books were 2ms fresh (verified
+    2026-08-07). The gate now only cares about a burst within the 60s storm
+    window, or actual staleness."""
+    health.record_message("binance")
+    health.record_message("polymarket")
+    for _ in range(MAX_RECONNECTS + 1):
+        clock.advance(120.0)  # 2 minutes apart — outside the 60s storm window
+        health.record_reconnect("polymarket")
+        health.record_message("polymarket")  # keep the feed fresh
+        health.record_message("binance")
+
+    assert health.reconnect_count("polymarket") == MAX_RECONNECTS + 1  # still a metric
+    assert health.is_healthy() is True  # fresh + no active storm
+
+
+def test_reconnect_burst_within_storm_window_is_unhealthy(health, clock):
+    """A burst of reconnects within the 60s storm window IS unhealthy even
+    while messages are arriving — an actively-thrashing connection's data is
+    not reliable enough to trade on."""
+    health.record_message("binance")
+    health.record_message("polymarket")
+    for _ in range(MAX_RECONNECTS + 1):
+        clock.advance(5.0)
+        health.record_reconnect("polymarket")
+        health.record_message("polymarket")
+        health.record_message("binance")
+
+    assert health.reconnect_storm_count("polymarket") == MAX_RECONNECTS + 1
+    assert health.is_healthy() is False
+
+
 def test_seconds_since_last_message(health, clock):
     assert health.seconds_since_last_message("binance") is None
     health.record_message("binance")
