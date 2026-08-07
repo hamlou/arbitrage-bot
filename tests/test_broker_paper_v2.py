@@ -7,7 +7,7 @@ close_position_early(), and min-order-size/tick-size enforcement.
 import pytest
 
 from data.polymarket_feed import Market, OrderBook, OrderBookLevel
-from engine.broker_paper import OrderTooSmallError, PaperBroker, SumToOneEdgeLostError
+from engine.broker_paper import InsufficientBalanceError, OrderTooSmallError, PaperBroker, SumToOneEdgeLostError
 from engine.sum_to_one import find_sum_to_one_opportunity
 from storage.db import Database
 
@@ -222,6 +222,32 @@ async def test_place_sum_to_one_order_buys_both_legs(db):
     combo_ids = {t["combo_group_id"] for t in open_trades}
     assert len(combo_ids) == 1
     assert None not in combo_ids
+
+
+async def test_sum_to_one_prechecks_total_cost_no_half_open_hedge(db):
+    """The combo's TOTAL cost (both legs + fees) is validated before either
+    leg opens. The sequential code could raise InsufficientBalanceError on the
+    second leg after the first already opened — leaving a HALF-OPEN hedge with
+    no reversal path (reviewed 2026-08-07)."""
+    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+             "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    feed = FakeFeed(books)
+    market = make_market()
+    # Total cost = 100 * 1.02 = $102; balance $101 covers one leg's $51 but
+    # not both — each leg alone would pass its own per-leg check.
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=101, fee_pct=0.02)
+
+    opp = find_sum_to_one_opportunity(
+        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.02,
+    )
+    assert opp is not None
+
+    with pytest.raises(InsufficientBalanceError):
+        await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    # Nothing opened, nothing debited — no half-open hedge to clean up.
+    assert await db.get_open_trades(mode="PAPER") == []
+    assert broker.balance_usd == pytest.approx(101)
 
 
 async def test_sum_to_one_reverses_when_edge_evaporates_at_fill(db):

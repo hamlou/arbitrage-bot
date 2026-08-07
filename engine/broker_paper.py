@@ -369,14 +369,66 @@ class PaperBroker:
         """
         combo_group_id = str(uuid.uuid4())
         half = total_size_usd / 2
-        yes_fill = await self.place_order(
-            opportunity.market, "YES", half, strategy="sum_to_one", combo_group_id=combo_group_id,
-            book_source=book_source,
+
+        # Pre-check the TOTAL cost (both legs + fees) BEFORE opening either
+        # leg. Two reasons (reviewed 2026-08-07): (1) with concurrent legs,
+        # two per-leg balance checks could each pass while the combined cost
+        # exceeds the balance — the total must be validated up front;
+        # (2) sequentially, the second leg could raise InsufficientBalanceError
+        # after the first already opened, leaving a HALF-OPEN hedge that the
+        # edge-revalidation below never sees.
+        total_cost = total_size_usd * (1 + self.fee_pct)
+        if total_cost > self.balance_usd:
+            raise InsufficientBalanceError(
+                f"Sum-to-one combo cost incl. fees ${total_cost:.2f} exceeds "
+                f"paper balance ${self.balance_usd:.2f}"
+            )
+
+        # Submit BOTH legs concurrently. Sequential submission let the book
+        # move for the full fill latency TWICE between the two halves of the
+        # hedge (each leg pays simulated_fill_latency_s on its own) — fills
+        # landed at 0.31+0.73=1.04 and 0.17+0.89=1.06, the −$45.94 loss.
+        # asyncio.gather overlaps the two latency waits so both legs fill
+        # against a ~simultaneous book. The per-leg balance checks each see
+        # half*(1+fee) <= balance; since the total was pre-validated above,
+        # both debits are safe.
+        results = await asyncio.gather(
+            self.place_order(
+                opportunity.market, "YES", half, strategy="sum_to_one",
+                combo_group_id=combo_group_id, book_source=book_source,
+            ),
+            self.place_order(
+                opportunity.market, "NO", half, strategy="sum_to_one",
+                combo_group_id=combo_group_id, book_source=book_source,
+            ),
+            return_exceptions=True,
         )
-        no_fill = await self.place_order(
-            opportunity.market, "NO", half, strategy="sum_to_one", combo_group_id=combo_group_id,
-            book_source=book_source,
-        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        if failed:
+            # One leg failed (e.g. insufficient book depth). Reverse the leg
+            # that DID open so the hedge is never left half-open, then
+            # re-raise the original error. close_position_early returns None
+            # (not an exception) when there is no bid depth to sell into —
+            # that escape must be logged loudly, never silent, or a half-open
+            # hedge would persist without a trace.
+            for fill in results:
+                if isinstance(fill, Exception):
+                    continue
+                try:
+                    pnl = await self.close_position_early(
+                        opportunity.market, fill.trade_id, reason="SUM_TO_ONE_LEG_FAILED",
+                    )
+                except Exception:
+                    logger.exception("Failed to reverse sum-to-one leg after sibling failure")
+                else:
+                    if pnl is None:
+                        logger.warning(
+                            "Sum-to-one leg %d could NOT be reversed after sibling failure "
+                            "(no bid depth) — half-open hedge remains on %s",
+                            fill.trade_id, opportunity.market.market_id,
+                        )
+            raise failed[0]
+        yes_fill, no_fill = results  # type: ignore[assignment]
 
         # Re-validate the locked edge from the ACTUAL fills, not the
         # decision-time best asks. The opportunity was detected against best
@@ -402,11 +454,18 @@ class PaperBroker:
             )
             for fill in (yes_fill, no_fill):
                 try:
-                    await self.close_position_early(
+                    pnl = await self.close_position_early(
                         opportunity.market, fill.trade_id, reason="SUM_TO_ONE_EDGE_LOST",
                     )
                 except Exception:
                     logger.exception("Failed to reverse sum-to-one leg %d after edge loss", fill.trade_id)
+                else:
+                    if pnl is None:
+                        logger.warning(
+                            "Sum-to-one leg %d could NOT be reversed after edge loss "
+                            "(no bid depth) — half-open hedge remains on %s",
+                            fill.trade_id, opportunity.market.market_id,
+                        )
             raise SumToOneEdgeLostError(combined_cost, locked_edge_pct)
 
         return yes_fill, no_fill

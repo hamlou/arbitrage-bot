@@ -113,13 +113,19 @@ def fit_calibration(
 
     magnitudes = [s[0] for s in samples]
     held = [1.0 if s[1] else 0.0 for s in samples]
-    breakpoints, probs, _counts = quantile_bin_stats(magnitudes, held, n_bins)
+    breakpoints, probs, counts = quantile_bin_stats(magnitudes, held, n_bins)
 
     if not breakpoints:
         return None
 
-    # Enforce monotonic non-decreasing continuation probability with magnitude.
-    probs = list(np.maximum.accumulate(probs))
+    # Enforce monotonic non-decreasing continuation probability with magnitude
+    # via pool-adjacent-violators isotonic regression. The old
+    # np.maximum.accumulate copied a single noisy peak forward into every
+    # later bin (the 2026-08-07 fit has 7 of 8 bins identical at one value) —
+    # it would flatten a real small edge just as easily as noise. PAV pools
+    # only actual monotonicity violations, so the curve stays faithful to the
+    # data everywhere else.
+    probs = _isotonic_pav(probs, counts)
     # Never let the curve claim *worse* than a coin flip — if the raw data
     # says otherwise, that's a sign of too little data, not a real edge to bake in.
     probs = [max(0.5, p) for p in probs]
@@ -131,6 +137,59 @@ def fit_calibration(
         sample_count=len(samples),
         fitted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
+
+
+def _isotonic_pav(rates: list[float], counts: list[int]) -> list[float]:
+    """
+    Monotone non-decreasing isotonic fit by pool-adjacent-violators.
+
+    Returns one value PER INPUT BIN (pooled bins share their pooled mean), so
+    the result keeps the same length as magnitude_breakpoints for np.interp.
+    Weighted by bin count (quantile bins are near-equal, but the final bin
+    from np.array_split can differ). Unlike np.maximum.accumulate — which
+    copies one noisy peak forward into every later bin — only actual
+    descending violations are pooled, leaving already-monotonic stretches
+    untouched.
+    """
+    if not rates:
+        return []
+    n = len(rates)
+    sums = [rates[i] * counts[i] for i in range(n)]
+    weights = [float(counts[i]) for i in range(n)]
+    starts = list(range(n))
+    ends = list(range(n))
+    i = 0
+    while i < n - 1:
+        if sums[i] / weights[i] <= sums[i + 1] / weights[i + 1]:
+            i += 1
+            continue
+        # Merge blocks i and i+1, then backtrack while the merged block
+        # violates monotonicity with its predecessor.
+        sums[i] += sums[i + 1]
+        weights[i] += weights[i + 1]
+        ends[i] = ends[i + 1]
+        del sums[i + 1]
+        del weights[i + 1]
+        del starts[i + 1]
+        del ends[i + 1]
+        n -= 1
+        while i > 0 and sums[i - 1] / weights[i - 1] > sums[i] / weights[i]:
+            sums[i - 1] += sums[i]
+            weights[i - 1] += weights[i]
+            ends[i - 1] = ends[i]
+            del sums[i]
+            del weights[i]
+            del starts[i]
+            del ends[i]
+            n -= 1
+            i -= 1
+        i += 1
+    out = [0.0] * len(rates)
+    for b in range(n):
+        mean = sums[b] / weights[b]
+        for idx in range(starts[b], ends[b] + 1):
+            out[idx] = mean
+    return out
 
 
 def build_samples_from_price_series(

@@ -37,6 +37,12 @@ RECONNECT_STORM_WINDOW_S = 60.0
 # than 3 reconnects in the window is unhealthy", so up to and including
 # MAX_RECONNECTS (3) is healthy and 4+ is not.
 MAX_RECONNECTS = 3
+# Secondary gate (reviewed 2026-08-07): a feed reconnecting steadily (e.g.
+# every ~90s) never clusters into a 60s storm, so the storm window alone
+# would report it "healthy" indefinitely despite chronic instability. More
+# than this many reconnects in the 10-minute METRIC window is unhealthy too.
+# 6 = ~1.5/min sustained for 10 minutes.
+MAX_RECONNECTS_10M = 6
 MAX_STALE_S = 10.0             # more than this many seconds since last message = unhealthy
 
 FEEDS = ("binance", "polymarket")
@@ -132,14 +138,18 @@ class FeedHealth:
         True if THIS single feed has received a message within the last
         MAX_STALE_S seconds (a never-messaged feed is unhealthy) AND is not
         in an active reconnect storm (more than MAX_RECONNECTS reconnects in
-        the last RECONNECT_STORM_WINDOW_S seconds). Reconnects that happened
-        minutes ago and aged out of the storm window do NOT make a currently-
-        fresh feed unhealthy. Exposed separately from is_healthy() so callers
-        (e.g. the dashboard) can show per-feed status instead of only a
-        combined bool.
+        the last RECONNECT_STORM_WINDOW_S seconds) AND has not exceeded the
+        sustained-reconnect hard limit (more than MAX_RECONNECTS_10M
+        reconnects in the last 10 minutes). Reconnects that happened minutes
+        ago and aged out of the storm window do NOT make a currently-fresh
+        feed unhealthy — but a chronically unstable cadence still does.
+        Exposed separately from is_healthy() so callers (e.g. the dashboard)
+        can show per-feed status instead of only a combined bool.
         """
         self._require_feed(feed)
         if self.reconnect_storm_count(feed) > MAX_RECONNECTS:
+            return False
+        if self.reconnect_count(feed) > MAX_RECONNECTS_10M:
             return False
         since = self.seconds_since_last_message(feed)
         if since is None or since > MAX_STALE_S:

@@ -357,21 +357,27 @@ class TradingApp:
                         # confidently wrong in direction (836 saturated reads
                         # like "model 2% vs market 99.5%" in one run). Only
                         # trust a first-sighting reference when the window is
-                        # still mostly ahead of us.
+                        # still mostly ahead of us. FAILS CLOSED: when the
+                        # remaining time can't be computed (None), we cannot
+                        # tell if the price is stale — so we don't trust it
+                        # (reviewed 2026-08-07: the guard used to fall
+                        # through to trusting in exactly that case).
                         remaining = m.time_remaining_s
                         duration_s = (m.duration_minutes or 15) * 60
                         if (
-                            remaining is not None
-                            and remaining < duration_s * settings.REFERENCE_TRUST_MIN_REMAINING_PCT
+                            remaining is None
+                            or remaining < duration_s * settings.REFERENCE_TRUST_MIN_REMAINING_PCT
                         ):
                             # Leave reference_price unset -> fair-value stays
                             # off; the calibrated momentum fallback (honestly
                             # ~52%) will refuse to invent an edge on stale
                             # inputs, so no phantom trade fires.
                             logger.debug(
-                                "Late first sighting of %s (%.0fs of %ds left) — "
+                                "Late or unknown first sighting of %s (%s) — "
                                 "reference price not trusted, fair-value stays off",
-                                m.market_id, remaining, duration_s,
+                                m.market_id,
+                                f"{remaining:.0f}s of {duration_s}s left" if remaining is not None
+                                else "remaining time unknown",
                             )
                         else:
                             ref_price = self.signal_engine.current_price(m.asset)

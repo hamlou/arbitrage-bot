@@ -13,8 +13,10 @@ dead: a CRITICAL Telegram alert is sent (never muted, never dropped). Alerts
 are deduped — at most one per ALERT_COOLDOWN_S (default 3600s), tracked in
 storage/watchdog_state.json, so a dead bot alerts once, not every 5 minutes.
 
-Intended to run from Windows Task Scheduler every 5 minutes. Exits 0 always
-(a watchdog failure to check is itself reported to Telegram, never silently).
+Intended to run every 5 minutes from scripts/watchdog_loop.vbs (a hidden loop
+in the Windows Startup folder — Task Scheduler on this machine silently fails
+to execute tasks, verified 2026-08-07). Exits 0 always (a watchdog failure to
+check is itself reported to Telegram, never silently).
 
 Usage:
     python scripts/watchdog.py

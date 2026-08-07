@@ -4,10 +4,18 @@
 ' nothing ever runs).
 ' Every 5 minutes: run scripts\watchdog.py, which alerts Telegram (deduped to
 ' once per hour) if the bot has been silent for more than 15 minutes.
+'
+' The repo path is derived from THIS script's own location
+' (<repo>\scripts\watchdog_loop.vbs) rather than a hand-typed absolute path
+' (reviewed 2026-08-07): the watchdog exists to catch silent failures, so it
+' must not become one if the folder is renamed, moved, or re-cloned. WScript.
+' ScriptFullName is the full path to this file; the repo is its parent's
+' parent.
 Option Explicit
-Dim sh, repo, python, cmd
+Dim fso, sh, repo, python, cmd
+Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
-repo = "C:\Users\hp\Desktop\polymarket-arb-bot (1)\polymarket-arb-bot"
+repo = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
 python = repo & "\.venv\Scripts\python.exe"
 Do
     cmd = "cmd /c cd /d """ & repo & """ && """ & python & """ -u scripts\watchdog.py >> storage\watchdog.log 2>&1"

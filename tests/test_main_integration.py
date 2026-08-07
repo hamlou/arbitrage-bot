@@ -155,6 +155,49 @@ async def test_late_first_sighting_does_not_trust_reference_price(app_settings, 
         await app.db.close()
 
 
+async def test_unknown_time_remaining_does_not_trust_reference_price(app_settings, caplog):
+    """The trust guard FAILS CLOSED (reviewed 2026-08-07): when the remaining
+    time can't be computed (unparseable expiry -> time_remaining_s is None),
+    we cannot tell whether the first-sighting price is stale — so it must NOT
+    be trusted as the open reference. The old condition fell through to
+    trusting in exactly this case."""
+    app = await build_app(app_settings)
+    try:
+        app.signal_engine.ingest_price_update(
+            PriceUpdate(symbol="BTCUSDT", price=65000.0, event_time_ms=0, received_at=time.time(), kind="trade")
+        )
+        unknown_market = dataclasses.replace(
+            make_market(market_id="unknown_mkt", reference_price=None),
+            expires_at_ts=None,  # -> time_remaining_s is None
+        )
+        app.feed.register(
+            unknown_market,
+            make_book(unknown_market.token_id_yes, 0.49, 0.51),
+            make_book(unknown_market.token_id_no, 0.49, 0.51),
+        )
+
+        async def stop_after_one(*args, **kwargs):
+            raise StopAsyncIteration
+
+        original_sleep = asyncio.sleep
+        asyncio.sleep = stop_after_one  # type: ignore[assignment]
+        try:
+            with caplog.at_level(logging.DEBUG, logger="main"):
+                try:
+                    await app._market_discovery_loop()
+                except StopAsyncIteration:
+                    pass
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        known = app._known_markets.get("unknown_mkt")
+        assert known is not None
+        assert known.reference_price is None  # fails closed: unknown -> not trusted
+        assert "reference price not trusted" in caplog.text
+    finally:
+        await app.db.close()
+
+
 async def test_early_first_sighting_does_trust_reference_price(app_settings):
     """A market first seen near its open (most of the window remaining) gets a
     trusted reference price, so the fair-value model can run normally."""

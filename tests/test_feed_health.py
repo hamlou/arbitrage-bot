@@ -8,6 +8,7 @@ import pytest
 from engine.feed_health import (
     FEEDS,
     MAX_RECONNECTS,
+    MAX_RECONNECTS_10M,
     MAX_STALE_S,
     RECONNECT_WINDOW_S,
     FeedHealth,
@@ -141,6 +142,24 @@ def test_reconnect_burst_within_storm_window_is_unhealthy(health, clock):
 
     assert health.reconnect_storm_count("polymarket") == MAX_RECONNECTS + 1
     assert health.is_healthy() is False
+
+
+def test_steady_reconnect_cadence_trips_10m_hard_limit(health, clock):
+    """A feed reconnecting steadily (~60s apart) never forms a 60s storm but
+    is chronically unstable — the 10-minute hard limit must catch it
+    (reviewed 2026-08-07: the storm-only gate would have reported this
+    connection healthy forever)."""
+    health.record_message("binance")
+    health.record_message("polymarket")
+    for _ in range(MAX_RECONNECTS_10M + 1):
+        clock.advance(60.0)
+        health.record_reconnect("polymarket")
+        health.record_message("polymarket")
+        health.record_message("binance")
+
+    assert health.reconnect_storm_count("polymarket") <= MAX_RECONNECTS  # never a burst
+    assert health.reconnect_count("polymarket") == MAX_RECONNECTS_10M + 1
+    assert health.is_healthy() is False  # caught by the sustained-cadence limit
 
 
 def test_seconds_since_last_message(health, clock):

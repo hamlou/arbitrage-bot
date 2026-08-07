@@ -78,6 +78,33 @@ def test_implied_probability_down_direction_below_half():
     assert p < 0.5
 
 
+# -- isotonic monotonicity (pool-adjacent-violators) -----------------------------
+
+
+def test_pav_pools_only_violations():
+    from engine.calibration import _isotonic_pav
+    # Only the descending pair (0.6, 0.5) is pooled -> both become their mean;
+    # the already-monotonic stretches are untouched.
+    assert _isotonic_pav([0.4, 0.6, 0.5, 0.7], [1, 1, 1, 1]) == pytest.approx([0.4, 0.55, 0.55, 0.7])
+
+
+def test_pav_does_not_copy_peak_forward():
+    from engine.calibration import _isotonic_pav
+    # The 2026-08-07 artifact: np.maximum.accumulate locked one noisy bin as
+    # the floor for every later bin (7 of 8 identical values). PAV must NOT do
+    # that — the dip after the peak pools with its neighbors instead.
+    rates = [0.5019660735591638, 0.5195829226539399, 0.50, 0.51, 0.52]
+    out = _isotonic_pav(rates, [1] * 5)
+    assert out[1] != out[4]  # the peak was NOT propagated to the end
+    assert out == sorted(out)  # still monotone non-decreasing
+
+
+def test_pav_is_count_weighted():
+    from engine.calibration import _isotonic_pav
+    # A violation with unequal bin counts must be pooled by weighted mean.
+    assert _isotonic_pav([0.7, 0.5], [1, 3]) == pytest.approx([0.55, 0.55])
+
+
 # -- CalibrationModel serialization ---------------------------------------------
 
 def test_model_round_trips_through_dict():
