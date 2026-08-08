@@ -32,6 +32,7 @@ from engine.lag_tracker import LagMeasurement, LagTracker
 from engine.latency import LatencyTracker
 from engine.risk import RiskManager, SignalForSizing
 from engine.signal import SignalEngine
+from engine.single_instance import SingleInstanceLock
 from engine.sum_to_one import find_sum_to_one_opportunity
 from storage.db import Database
 from ui.dashboard import DashboardState, run_dashboard
@@ -1464,8 +1465,21 @@ class TradingApp:
 
 
 async def main() -> None:
+    # Single-instance guard: refuse to start if another bot process is already
+    # running against this storage directory (two bots = doubled API load,
+    # fighting over the same positions, and a log flood — seen twice).
+    lock = SingleInstanceLock(Path(settings.DATABASE_PATH).parent / "bot.lock")
+    if not lock.acquire():
+        logger.critical(
+            "Another bot instance is already running (storage/bot.lock is held). "
+            "Kill the existing process and retry."
+        )
+        sys.exit(1)
     app = TradingApp()
-    await app.run()
+    try:
+        await app.run()
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

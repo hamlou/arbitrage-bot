@@ -1,21 +1,21 @@
 """
-Polymarket fee model (single source of truth — docs.polymarket.com/trading/fees).
+Polymarket fee model (single source of truth).
 
-Polymarket's crypto-market taker fee is NOT a flat fraction of size. It is
-price-dependent, per share:
+Polymarket's taker fee is NOT a flat fraction of size. It is price-dependent,
+per share:
 
     fee = C * fee_rate * p * (1 - p)
 
-where C is the number of shares, p is the share price, and fee_rate is 0.07
-for crypto markets (maker fee is 0).
+where C is the number of shares, p is the share price, and fee_rate is the
+taker fee coefficient (maker receives a rebate).
 
 As a fraction of what you actually spend (C * p), that works out to:
 
     fee / notional = fee_rate * (1 - p)
 
-i.e. ~3.5% of notional per side at p = 0.50, ~1.5% at p = 0.78, and larger
-at low prices. A taker round trip (entry + exit) pays it twice, so the
-round-trip fee hurdle at p ~ 0.5 is ~7% of notional BEFORE spread.
+i.e. ~3% of notional per side at p = 0.50, ~1.3% at p = 0.78, and larger at
+low prices. A taker round trip (entry + exit) pays it twice, so the
+round-trip fee hurdle at p ~ 0.5 is ~6% of notional BEFORE spread.
 
 Why this matters for this strategy (verified 2026-08-07): the earlier flat
 2% fee assumption UNDERSTATED mid-price fees — paper results looked better
@@ -28,9 +28,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Polymarket's crypto taker fee RATE (docs.polymarket.com/trading/fees).
-# Applied as fee_rate * p * (1 - p) per share. Maker fee is 0.
-DEFAULT_TAKER_FEE_RATE = 0.07
+# Polymarket's taker fee RATE (fee coefficient Theta). VERIFIED 2026-08-08
+# against https://docs.polymarket.us/fees ("Fee Schedule - Polymarket US
+# Documentation", effective 12 AM ET Wednesday July 1, 2026): "Fees are
+# computed using a symmetric formula that scales with price uncertainty:
+# Fee = Theta x C x p x (1 - p)" with Theta (taker) = 0.06 and maker rebate
+# -0.0125. Applied as fee_rate * p * (1 - p) per share.
+DEFAULT_TAKER_FEE_RATE = 0.06
 
 
 def taker_fee_per_share(price: float, fee_rate: float = DEFAULT_TAKER_FEE_RATE) -> float:
@@ -40,7 +44,7 @@ def taker_fee_per_share(price: float, fee_rate: float = DEFAULT_TAKER_FEE_RATE) 
     also a per-share price difference) and to per-share combined costs like
     a sum-to-one pair's yes_ask + no_ask.
 
-    Peaks at fee_rate * 0.25 (~1.75c per share at fee_rate=0.07, p=0.50);
+    Peaks at fee_rate * 0.25 (~1.5c per share at fee_rate=0.06, p=0.50);
     zero at p=0 and p=1.
     """
     p = min(max(price, 0.0), 1.0)
@@ -53,7 +57,7 @@ def taker_fee_fraction_of_notional(price: float, fee_rate: float = DEFAULT_TAKER
     in fees (since size = C * p and the per-share fee is rate*p*(1-p), the
     fee is (size/p) * rate*p*(1-p) = size * rate*(1-p)).
 
-    ~3.5% of notional at p=0.50, ~1.5% at p=0.78, ~4.9% at p=0.30 — higher
+    ~3% of notional at p=0.50, ~1.3% at p=0.78, ~4.2% at p=0.30 — higher
     at low prices, lower at high prices.
     """
     p = min(max(price, 0.0), 1.0)

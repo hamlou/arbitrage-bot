@@ -72,16 +72,22 @@ class Settings(BaseSettings):
     # (the latter can mathematically never profit after fees) and lost ~$170
     # on two of those entries. 0.80 is deliberately conservative.
     MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.80
-    # Polymarket's crypto taker fee RATE (docs.polymarket.com/trading/fees) —
-    # NOT a flat fraction. The per-share fee is fee_rate * p * (1 - p); as a
-    # fraction of what you spend that is fee_rate * (1 - p) per side (~3.5%
-    # of notional at p=0.50, ~1.5% at p=0.78, larger at low prices). A taker
-    # round trip pays it twice, so at p~0.5 the fee hurdle is ~7% of notional
-    # before spread. All fee math lives in engine/fees.py; this setting is
-    # the single source of truth for the RATE. Changed 2026-08-07: was a flat
-    # 2% assumption that UNDERSTATED mid-price fees — paper results looked
-    # better than live would be.
-    TAKER_FEE_PCT: float = 0.07
+    # Polymarket's crypto taker fee RATE — NOT a flat fraction. The per-share
+    # fee is fee_rate * p * (1 - p); as a fraction of what you spend that is
+    # fee_rate * (1 - p) per side (~3% of notional at p=0.50, ~1.2% at
+    # p=0.80). A taker round trip pays it twice, so at p~0.5 the fee hurdle
+    # is ~6% of notional before spread. All fee math lives in engine/fees.py;
+    # this setting is the single source of truth for the RATE.
+    # VERIFIED 2026-08-08 against https://docs.polymarket.us/fees ("Fee
+    # Schedule - Polymarket US Documentation", effective 12 AM ET Wednesday
+    # July 1, 2026): "Fees are computed using a symmetric formula that scales
+    # with price uncertainty: Fee = Theta x C x p x (1 - p)", with Theta
+    # (taker fee coefficient) = 0.06, maker rebate = -0.0125. Prior value
+    # 0.07 came from a less precise source and OVERSTATED the coefficient by
+    # ~17% — the safe direction, but it throttled marginal trades that would
+    # actually clear fees. The flat 2% assumption (pre-2026-08-07)
+    # UNDERSTATED mid-price fees — paper results looked better than live.
+    TAKER_FEE_PCT: float = 0.06
     # Cross-exchange sanity gate: before firing a signal, the latest known
     # Binance and Coinbase prices for the asset must agree within this many
     # percent (0.1 = 0.1%). A bigger divergence usually means one feed is
@@ -232,7 +238,15 @@ class Settings(BaseSettings):
     # mid must move for the market to count as "repriced", and
     # LAG_TRACK_TIMEOUT_S is how long to wait before recording the market as a
     # laggard (timed_out). Purely diagnostic — no trade decision reads these.
-    LAG_TRACK_MOVE_MIN_PCT: float = 0.0010   # 0.10% CUMULATIVE move (from baseline) triggers a lag measurement
+    # Lowered 2026-08-08 from 0.10% to 0.03%: with the per-tick bug fixed, a
+    # 0.10% CUMULATIVE trigger still only fired ONE measurement in 9h of
+    # runtime (quiet BTC/ETH sessions rarely move 0.10% within a few seconds).
+    # 0.03% captures 3-10x more samples — more diagnostic data, and it NEVER
+    # gates trading (this block is instrumentation only). max_pending=200 in
+    # LagTracker still fits comfortably: pending measurements resolve within
+    # LAG_TRACK_TIMEOUT_S (30s), so even at the higher trigger rate only a
+    # handful are in flight per symbol.
+    LAG_TRACK_MOVE_MIN_PCT: float = 0.0003   # 0.03% CUMULATIVE move (from baseline) triggers a lag measurement
     LAG_REPRICE_MIN_MOVE: float = 0.005      # absolute mid move (0.5c) counts as repriced
     LAG_TRACK_TIMEOUT_S: float = 30.0        # give the market this long to reprice
     LAG_TRACK_INTERVAL_S: float = 0.2        # how often the tracker loop scans
