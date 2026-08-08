@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 
 CONFIRMATION_WINDOW = 3        # consecutive ticks required to agree on direction (momentum fallback only)
 MOMENTUM_LOOKBACK_S = 30.0     # window over which we measure recent price change (momentum fallback only)
+# Minimum NET move over the 30s window (as a fraction) for the fallback to
+# assign a direction from momentum's SIGN. Verified 2026-08-08: the fallback
+# used to require CONFIRMATION_WINDOW consecutive same-direction ticks, but
+# trade-by-trade BTC data oscillates up/down/up, so direction_confirmed()
+# almost never returned a value — 66% of 16,019 live signals died with
+# "insufficient data (no fair-value inputs and no confirmed momentum yet)"
+# and the bot fired ZERO directional trades in 20.7h. The net window move
+# (with this floor) is the signal that matters; the fresh-move gate still
+# requires recent aligned momentum before anything fires.
+MOMENTUM_MIN_PCT = 0.0001      # 0.01% net move over 30s is a real direction
 VOLATILITY_LOOKBACK_S = 120.0  # wider window for a more stable realized-vol estimate (fair value model)
 MIN_TICKS_FOR_VOLATILITY = 8
 # A price tick older than this (seconds) is treated as "missing" by the
@@ -346,6 +356,17 @@ class SignalEngine:
         if implied_prob is None:
             direction = tracker.direction_confirmed()
             momentum = tracker.momentum_pct()
+            # 2026-08-08 fix (measured, not guessed): direction_confirmed()
+            # requires CONFIRMATION_WINDOW consecutive same-direction ticks,
+            # which trade-by-trade BTC data almost never produces — the
+            # fallback was effectively dead, and 66% of all live signals died
+            # of "insufficient data". Use the SIGN of the net 30s window move
+            # (above a tiny magnitude floor) as the direction instead. The
+            # fresh-move gate below still requires recent aligned momentum
+            # before anything fires, so this only unblocks evaluation, it
+            # does not loosen entry discipline.
+            if direction is None and momentum is not None and abs(momentum) >= MOMENTUM_MIN_PCT:
+                direction = "UP" if momentum > 0 else "DOWN"
             if direction is not None and momentum is not None:
                 implied_prob = self._momentum_implied_probability(momentum, direction, market.duration_minutes)
                 model_used = "momentum_fallback"

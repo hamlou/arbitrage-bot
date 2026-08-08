@@ -88,6 +88,32 @@ async def test_falls_back_to_momentum_without_reference_price(db):
 
 # -- the reviewer's exact scenario, at the full evaluate() level -----------------
 
+async def test_fallback_fires_on_net_momentum_with_oscillating_ticks(db):
+    """
+    Regression guard for the 2026-08-08 live bug: the momentum fallback
+    required CONFIRMATION_WINDOW consecutive same-direction ticks, which
+    trade-by-trade BTC data almost never produces (66% of 16,019 live signals
+    died with "insufficient data", 0 directional trades in 20.7h). Oscillating
+    ticks with a NET upward drift must now reach the fallback via the sign of
+    the net window momentum.
+    """
+    settings = make_settings(EDGE_THRESHOLD_PCT=0.01, MIN_CONFIDENCE=0.2)
+    engine = SignalEngine(settings, db)
+
+    # Up/down/up/down — direction_confirmed() is None (no 3 consecutive same-
+    # direction ticks) — but the net 30s move is clearly positive.
+    prices = [100.00, 100.08, 100.04, 100.12, 100.06, 100.16, 100.10, 100.20, 100.14, 100.24]
+    feed_ticks(engine, prices)
+
+    market = make_market(reference_price=None)  # no reference -> fair value impossible
+    yes_book = make_book("tok_yes", 0.45, 0.47)
+    no_book = make_book("tok_no", 0.51, 0.53)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.model_used == "momentum_fallback"  # the net-momentum sign path, not insufficient data
+    assert signal.implied_prob > 0.5  # leans YES on net up-drift
+
+
 async def test_reviewers_scenario_below_reference_despite_upward_momentum(db):
     """
     BTC starts contract at $70,000, falls to $69,500, then rises to $69,650.

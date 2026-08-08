@@ -294,6 +294,46 @@ async def test_discover_pages_past_ghost_crowd_to_find_live_windows():
     assert calls[1]["cursor"] == "cursor-2"
     assert [m.market_id for m in markets] == ["555"]
 
+async def test_discover_stops_on_repeated_cursor():
+    """
+    Regression guard for the 2026-08-08 live bug: /events/keyset repeatedly
+    served the SAME next_cursor for the same page, so discovery re-requested
+    that page up to MAX_DISCOVERY_PAGES times every cycle — and with two bot
+    processes that became ~10 identical requests/sec (16MB of log in under a
+    day). A cursor that repeats means every later page is identical: stop.
+    """
+    now = time.time()
+
+    def iso(offset_s: float) -> str:
+        return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    live = {
+        "id": "555",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["t_l_yes", "t_l_no"],
+        "liquidity": "12000",
+        "endDate": iso(300),
+        "closed": False,
+    }
+
+    calls = []
+
+    async def fake_gamma_get(path, params=None):
+        calls.append((params or {}).get("cursor"))
+        # Every response — including the first — echoes the same cursor, the
+        # exact stuck-cursor behavior seen live.
+        return {"events": [_keyset_event(live, "e-live")], "next_cursor": "stuck-cursor"}
+
+    feed = PolymarketFeed(min_liquidity_usd=1_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_active_markets()
+
+    # One request for the initial page; the repeated cursor must stop it.
+    assert len(calls) == 2
+    assert calls == [None, "stuck-cursor"]
+    assert [m.market_id for m in markets] == ["555"]
+
+
 def test_liquidity_filter_excludes_thin_markets():
     """MIN_MARKET_LIQUIDITY_USD filtering is applied by the caller
     (discover_active_markets); this test checks the raw parse + a manual

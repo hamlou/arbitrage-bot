@@ -232,10 +232,17 @@ class Settings(BaseSettings):
     # mid must move for the market to count as "repriced", and
     # LAG_TRACK_TIMEOUT_S is how long to wait before recording the market as a
     # laggard (timed_out). Purely diagnostic — no trade decision reads these.
-    LAG_TRACK_MOVE_MIN_PCT: float = 0.0010   # 0.10% move triggers a lag measurement
+    LAG_TRACK_MOVE_MIN_PCT: float = 0.0010   # 0.10% CUMULATIVE move (from baseline) triggers a lag measurement
     LAG_REPRICE_MIN_MOVE: float = 0.005      # absolute mid move (0.5c) counts as repriced
     LAG_TRACK_TIMEOUT_S: float = 30.0        # give the market this long to reprice
     LAG_TRACK_INTERVAL_S: float = 0.2        # how often the tracker loop scans
+    # If a per-symbol lag baseline hasn't triggered a measurement within this
+    # many seconds, re-anchor it to the current price (added 2026-08-08: the
+    # tracker compared per-tick moves and recorded ZERO measurements in 20.7h
+    # — trade-by-trade data never clears a 0.10% single-tick move). A move
+    # that never triggered in time isn't a front-runnable lag anymore; the
+    # market has likely already priced it.
+    LAG_TRACK_BASELINE_MAX_AGE_S: float = 5.0
 
     # --- Latency / timing budget ---------------------------------------------
     # The realistic arbitrage window for Polymarket's short-duration crypto

@@ -22,7 +22,7 @@ from alerts.telegram import AlertLevel, build_alerter, build_reporter
 from config.settings import settings
 from data.binance_feed import BinanceFeed, PriceUpdate
 from data.coinbase_feed import CoinbaseFeed
-from data.polymarket_feed import Market, OrderBook, PolymarketFeed
+from data.polymarket_feed import Market, OrderBook, PolymarketFeed, TokenNotFoundError
 from data.polymarket_ws_feed import PolymarketWSFeed
 from engine.broker_live import LiveBroker, LiveTradingNotEnabledError, build_live_broker
 from engine.broker_paper import PaperBroker, SumToOneEdgeLostError
@@ -171,9 +171,17 @@ class TradingApp:
             min_reprice_move=settings.LAG_REPRICE_MIN_MOVE,
             timeout_s=settings.LAG_TRACK_TIMEOUT_S,
         )
-        # Previous ingested price per symbol — the per-tick move that the lag
-        # tracker watches (independent of the fast path's cumulative trigger).
-        self._last_ingest_price: dict[str, float] = {}
+        # Per-symbol baseline (price, received_at) for the lag tracker.
+        # 2026-08-08 fix (measured, not guessed): this used to compare each
+        # tick to the PREVIOUS tick and required a 0.10% single-tick move —
+        # trade-by-trade data almost never produces that, so the tracker
+        # recorded ZERO measurements in 20.7h and the one instrument built to
+        # measure the arbitrage window was dead. It now measures the CUMULATIVE
+        # move from this baseline — reset only when a move fires or the
+        # baseline goes stale (same accumulation semantics as the fast path
+        # trigger), so a multi-tick drift that totals a real move starts a
+        # measurement.
+        self._lag_baseline: dict[str, tuple[float, float]] = {}
 
         # market_id -> Market, maintained by _market_discovery_loop, read (not
         # re-fetched) by the hot per-second trading cycle. This is what fixes
@@ -242,19 +250,40 @@ class TradingApp:
 
     def _record_lag_moves(self, update: PriceUpdate) -> None:
         """
-        Feed the lag tracker: when a Binance tick moves >= LAG_TRACK_MOVE_MIN_PCT
-        from the previous tick for that symbol, start measuring how long the
-        direction-implied Polymarket token of the most-liquid market for this
-        asset takes to reprice. Pure diagnostics; best-effort.
+        Feed the lag tracker: when the CUMULATIVE move from the per-symbol
+        baseline reaches LAG_TRACK_MOVE_MIN_PCT (over a ~1s+ window), start
+        measuring how long the direction-implied Polymarket token of the
+        most-liquid market for this asset takes to reprice. Pure diagnostics;
+        best-effort.
+
+        2026-08-08: the old per-tick comparison could never clear a 0.10%
+        threshold on trade-by-trade data (zero measurements in 20.7h). A
+        baseline is kept per symbol; the cumulative move from it is what
+        clears the threshold (same accumulation semantics as the fast path
+        trigger). The baseline is reset ONLY when a move fires or goes stale
+        (LAG_TRACK_BASELINE_MAX_AGE_S), so slow multi-tick drifts accumulate
+        instead of being sliced into per-tick micro-moves.
         """
         try:
-            last = self._last_ingest_price.get(update.symbol)
-            self._last_ingest_price[update.symbol] = update.price
-            if last is None or last <= 0:
+            symbol = update.symbol
+            now = update.received_at
+            baseline = self._lag_baseline.get(symbol)
+            if baseline is None:
+                self._lag_baseline[symbol] = (update.price, now)
                 return
-            move = (update.price - last) / last
+            base_price, base_ts = baseline
+            move = (update.price - base_price) / base_price
             if abs(move) < settings.LAG_TRACK_MOVE_MIN_PCT:
+                # Didn't fire. Re-anchor a stale baseline (a move that never
+                # triggered in time isn't a front-runnable lag anymore — the
+                # market has likely already priced it), otherwise keep
+                # accumulating.
+                if now - base_ts >= settings.LAG_TRACK_BASELINE_MAX_AGE_S:
+                    self._lag_baseline[symbol] = (update.price, now)
                 return
+            # Fired: record the move and re-anchor the baseline so moves are
+            # not double-counted.
+            self._lag_baseline[symbol] = (update.price, now)
             asset = update.symbol[:-4] if update.symbol.endswith("USDT") else update.symbol
             market = self._most_liquid_market_for(asset)
             if market is None:
@@ -269,7 +298,7 @@ class TradingApp:
                 asset=asset, move_pct=abs(move),
                 move_dir="UP" if move > 0 else "DOWN",
                 token_id=token_id, baseline_mid=book.mid,
-                ts=update.received_at,
+                ts=now,
             )
         except Exception:
             logger.debug("Lag tracking skipped for %s", update.symbol, exc_info=True)
@@ -613,6 +642,14 @@ class TradingApp:
                 try:
                     yes_book = await self.feed.get_order_book(market.market_id, market.token_id_yes)
                     no_book = await self.feed.get_order_book(market.market_id, market.token_id_no)
+                except TokenNotFoundError:
+                    # Market is gone from the CLOB (token 404) — drop it now so
+                    # the trading cycle stops re-polling a dead token every
+                    # second (it 404'd and retried 5x per cycle before the
+                    # 2026-08-08 fix). Best-effort; discovery would prune it
+                    # eventually anyway.
+                    self._known_markets.pop(market.market_id, None)
+                    return
                 except Exception:
                     logger.debug("Could not fetch order books for %s, skipping this cycle", market.market_id)
                     return
@@ -880,6 +917,14 @@ class TradingApp:
             if book is None:
                 try:
                     book = await self.feed.get_order_book(market.market_id, token_id)
+                except TokenNotFoundError:
+                    # Held token 404s (market ended) — do NOT prune the market
+                    # here: settlement closes the position via Gamma
+                    # (get_market_by_id), and pruning would silently kill this
+                    # position's exit monitoring. Just skip this cycle
+                    # (reviewed 2026-08-08 — pruning was moved to the entry
+                    # path only, where the market has no open position).
+                    continue
                 except Exception:
                     continue
             if book.mid is None:

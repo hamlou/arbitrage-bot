@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
+
+class TokenNotFoundError(Exception):
+    """A CLOB token id no longer exists (404) — the market is gone. Raised
+    deliberately OUTSIDE the @retry exception types so tenacity does not
+    re-request a dead token 5x with backoff every cycle (measured live
+    2026-08-08: dead tokens were retried every second by two bot processes,
+    flooding the 16MB err log with 404s). Callers prune the market."""
+
 DEFAULT_POLL_INTERVAL_S = 1.0
 
 # Only up/down windows ending within this horizon are worth discovering: a
@@ -202,6 +210,7 @@ class PolymarketFeed:
         # live windows.
         events: list[dict] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         for _ in range(MAX_DISCOVERY_PAGES):
             params: dict[str, Any] = {
                 "limit": 200,
@@ -215,15 +224,26 @@ class PolymarketFeed:
                 params["cursor"] = cursor
             raw = await self._gamma_get("/events/keyset", params=params)
             page_events = raw.get("events", []) if isinstance(raw, dict) else raw
-            events.extend(page_events or [])
-            cursor = raw.get("next_cursor") if isinstance(raw, dict) else None
-            if not cursor:
+            page_events = page_events or []
+            events.extend(page_events)
+            next_cursor = raw.get("next_cursor") if isinstance(raw, dict) else None
+            if not next_cursor:
                 break
+            # Stuck-cursor guard (added 2026-08-08, measured live): the API
+            # repeatedly served the SAME next_cursor for the same page — the
+            # loop re-requested that page up to MAX_DISCOVERY_PAGES times
+            # every discovery cycle, and with two bot processes that became
+            # ~10 identical requests/sec (16MB of log in under a day). A
+            # cursor that repeats means every later page is identical; stop.
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
             # Stop early once this page is entirely beyond the horizon.
             # Guard against None endDates (in some API slices the event-level
             # endDate is missing — it lives on the nested market instead).
             soonest_end = min(
-                (ts for ts in (_safe_ts(e.get("endDate")) for e in page_events or []) if ts is not None),
+                (ts for ts in (_safe_ts(e.get("endDate")) for e in page_events) if ts is not None),
                 default=None,
             )
             if soonest_end is not None and soonest_end > horizon_max:
@@ -330,6 +350,11 @@ class PolymarketFeed:
         resp = await self._client.get(f"{CLOB_BASE}/book", params={"token_id": token_id})
         if resp.status_code == 429:
             raise httpx.HTTPStatusError("rate limited", request=resp.request, response=resp)
+        if resp.status_code == 404:
+            # Dead token — NOT retryable (tenacity only retries TransportError
+            # and HTTPStatusError, and this raises neither). Added 2026-08-08:
+            # every expired market token 404'd and was retried 5x per cycle.
+            raise TokenNotFoundError(f"token {token_id} not found (404)")
         resp.raise_for_status()
         raw = resp.json()
         bids = tuple(
