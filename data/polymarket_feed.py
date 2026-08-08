@@ -97,8 +97,12 @@ class Market:
     token_id_no: str
     liquidity_usd: float
     end_date_iso: str
-    asset: str          # "BTC" or "ETH"
-    duration_minutes: int  # 5 or 15
+    # "BTC"/"ETH" for crypto up/down windows; "?" for any other binary
+    # market (sum-to-one universe — see discover_binary_markets). Optional
+    # since 2026-08-08: the risk-free sum-to-one scan is NOT confined to
+    # crypto up/down; it works on any 2-outcome market.
+    asset: str = "?"
+    duration_minutes: Optional[int] = None  # 5 or 15 for crypto windows
     resolved: bool = False
     outcome: Optional[str] = None  # set only once resolved
     # The price the underlying asset must beat for YES to win. NOT reliably
@@ -262,6 +266,81 @@ class PolymarketFeed:
                     continue
                 markets.append(parsed)
         # Deduplicate by market id (defensive: events can share nested markets).
+        seen: set[str] = set()
+        uniq: list[Market] = []
+        for m in markets:
+            if m.market_id in seen:
+                continue
+            seen.add(m.market_id)
+            uniq.append(m)
+        return uniq
+
+    async def discover_binary_markets(
+        self,
+        min_liquidity_usd: Optional[float] = None,
+        lookahead_s: float = 24 * 3600,
+        max_pages: int = 5,
+    ) -> list[Market]:
+        """
+        Discover active BINARY markets across ALL categories (no tag_slug
+        filter), for the risk-free sum-to-one scan. The directional strategy
+        stays BTC/ETH-only (its fair-value model is crypto-specific), but the
+        sum-to-one check is arithmetic and works on any 2-outcome market — and
+        several other categories are cheaper or fee-free, unlike the crowded,
+        fee-heavy crypto up/down corner. Added 2026-08-08.
+
+        Same keyset pagination + stuck-cursor guard + horizon early-stop as
+        discover_active_markets, but parsing with _parse_any_binary_market
+        and a longer lookahead (24h — sum-to-one doesn't care how long until
+        resolution, only that the book is live and summable).
+        """
+        min_liq = self.min_liquidity_usd if min_liquidity_usd is None else min_liquidity_usd
+        now = time.time()
+        horizon_max = now + lookahead_s
+
+        events: list[dict] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(max_pages):
+            params: dict[str, Any] = {
+                "limit": 200,
+                "active": "true",
+                "closed": "false",
+                "order": "endDate",
+                "ascending": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._gamma_get("/events/keyset", params=params)
+            page_events = raw.get("events", []) if isinstance(raw, dict) else raw
+            page_events = page_events or []
+            events.extend(page_events)
+            next_cursor = raw.get("next_cursor") if isinstance(raw, dict) else None
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+            soonest_end = min(
+                (ts for ts in (_safe_ts(e.get("endDate")) for e in page_events) if ts is not None),
+                default=None,
+            )
+            if soonest_end is not None and soonest_end > horizon_max:
+                break
+
+        markets: list[Market] = []
+        for ev in events:
+            for m in ev.get("markets") or []:
+                parsed = _parse_any_binary_market(m)
+                if parsed is None:
+                    continue
+                if parsed.liquidity_usd < min_liq:
+                    continue
+                exp = parsed.expires_at_ts
+                if exp is None or exp < now - 120 or exp > horizon_max:
+                    continue
+                markets.append(parsed)
         seen: set[str] = set()
         uniq: list[Market] = []
         for m in markets:
@@ -498,6 +577,49 @@ def _parse_gamma_market(m: dict[str, Any]) -> Optional[Market]:
         end_date_iso=end_date_iso,
         asset=asset,
         duration_minutes=duration,
+        resolved=bool(m.get("closed", False)),
+        expires_at_ts=expires_at_ts,
+    )
+
+
+def _parse_any_binary_market(m: dict[str, Any]) -> Optional[Market]:
+    """
+    Generic parser for ANY binary (exactly-2-outcome) market on the
+    platform — politics, sports, geopolitics, long-duration crypto, etc.
+    Unlike _parse_gamma_market, it does NOT require a short BTC/ETH up/down
+    window, so the risk-free sum-to-one scan (buying YES+NO for < $1 is pure
+    arithmetic) is not confined to the most fee-heavy, most crowded corner
+    of the platform. Added 2026-08-08.
+    """
+    tokens = m.get("clobTokenIds") or m.get("tokens")
+    if isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except (ValueError, TypeError):
+            tokens = None
+    if not tokens or len(tokens) != 2:
+        return None
+
+    try:
+        liquidity = float(m.get("liquidity", 0) or 0)
+    except (TypeError, ValueError):
+        liquidity = 0.0
+
+    end_date_iso = m.get("endDate", "")
+    expires_at_ts = None
+    if end_date_iso:
+        try:
+            expires_at_ts = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            logger.debug("Could not parse endDate %r for market %s", end_date_iso, m.get("id"))
+
+    return Market(
+        market_id=str(m.get("id") or m.get("conditionId") or ""),
+        question=m.get("question", ""),
+        token_id_yes=str(tokens[0]),
+        token_id_no=str(tokens[1]),
+        liquidity_usd=liquidity,
+        end_date_iso=end_date_iso,
         resolved=bool(m.get("closed", False)),
         expires_at_ts=expires_at_ts,
     )

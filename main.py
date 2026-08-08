@@ -189,6 +189,11 @@ class TradingApp:
         # the "Gamma called every single second" inefficiency — discovery now
         # runs on its own, slower, independent schedule.
         self._known_markets: dict[str, Market] = {}
+        # Lever 1 (2026-08-08): the risk-free sum-to-one universe — ALL binary
+        # market categories, not just BTC/ETH up/down. Kept in a SEPARATE dict
+        # so the crypto-only directional signal engine never sees non-crypto
+        # markets; only the sum-to-one scan consumes this.
+        self._sto_markets: dict[str, Market] = {}
         # Markets with at least one open position, independent of whether
         # they're still "active" — this is what fixes the settlement dead-code
         # bug: discover_active_markets() filters to active=true,closed=false,
@@ -422,8 +427,33 @@ class TradingApp:
                     if stale_id not in active_ids and stale_id not in self._open_position_market_ids:
                         del self._known_markets[stale_id]
 
+                # Lever 1: widen the risk-free sum-to-one scan to all binary
+                # categories. Separate universe, separate dict — the
+                # directional signal engine never sees these markets.
+                sto_markets: list[Market] = []
+                if settings.SUM_TO_ONE_DISCOVERY_ENABLED:
+                    sto_markets = await self.feed.discover_binary_markets(
+                        min_liquidity_usd=settings.SUM_TO_ONE_DISCOVERY_MIN_LIQUIDITY_USD,
+                        lookahead_s=settings.SUM_TO_ONE_DISCOVERY_LOOKAHEAD_S,
+                        max_pages=settings.SUM_TO_ONE_DISCOVERY_MAX_PAGES,
+                    )
+                    active_sto: dict[str, Market] = {}
+                    for m in sto_markets:
+                        if m.market_id in self._known_markets:
+                            continue  # directional universe already scans this one
+                        active_sto[m.market_id] = m
+                        if len(active_sto) >= settings.SUM_TO_ONE_DISCOVERY_MAX_MARKETS:
+                            break
+                    # Keep markets we still hold positions in until settled.
+                    for mid, m in self._sto_markets.items():
+                        if mid not in active_sto and mid in self._open_position_market_ids:
+                            active_sto[mid] = m
+                    self._sto_markets = active_sto
+
                 token_ids = []
                 for m in self._known_markets.values():
+                    token_ids.extend([m.token_id_yes, m.token_id_no])
+                for m in self._sto_markets.values():
                     token_ids.extend([m.token_id_yes, m.token_id_no])
                 self.ws_feed.update_assets(token_ids)
             except Exception:
@@ -538,6 +568,75 @@ class TradingApp:
             except Exception:
                 logger.exception("Live redemption failed for position %s", pos.get("conditionId"))
 
+    async def _scan_sum_to_one_universe(self, equity: float, cash: float) -> None:
+        """
+        Lever 1 (2026-08-08): the risk-free sum-to-one scan across ALL binary
+        market categories (politics, sports, geopolitics, long-duration crypto...),
+        not just BTC/ETH up/down. Buying YES+NO for < $1 (net of modeled fees)
+        locks in a risk-free profit at settlement — arithmetic, not prediction —
+        so it should not be confined to the most fee-heavy, most crowded corner
+        of the platform.
+
+        Consumes self._sto_markets (refreshed by _market_discovery_loop). The
+        directional signal engine never sees these markets; this is the only
+        consumer. At most ONE entry per cycle — the risk-free scan shouldn't
+        dump the whole bankroll in a single second.
+        """
+        if not settings.SUM_TO_ONE_DISCOVERY_ENABLED:
+            return
+        if not isinstance(self.broker, PaperBroker) or not self._sto_markets:
+            return
+
+        for market in list(self._sto_markets.values()):
+            if market.market_id in self._known_markets:
+                continue  # the directional cycle already scans this one
+            if self.broker.has_open_position(market.market_id):
+                continue
+            async with self._entry_lock:
+                if self.broker.has_open_position(market.market_id):
+                    continue
+                try:
+                    yes_book = await self.feed.get_order_book(market.market_id, market.token_id_yes)
+                    no_book = await self.feed.get_order_book(market.market_id, market.token_id_no)
+                except TokenNotFoundError:
+                    # Gone from the CLOB — prune so we stop re-polling a dead
+                    # token every cycle.
+                    self._sto_markets.pop(market.market_id, None)
+                    continue
+                except Exception:
+                    logger.debug("Sum-to-one: could not fetch books for %s, skipping this cycle", market.market_id)
+                    continue
+
+                sto = find_sum_to_one_opportunity(
+                    market, yes_book, no_book,
+                    settings.SUM_TO_ONE_MIN_EDGE_PCT, settings.TAKER_FEE_PCT,
+                )
+                if sto is None:
+                    continue
+
+                fresh_exposure = await self.broker.get_total_exposure_usd()
+                headroom = max(0.0, settings.MAX_TOTAL_EXPOSURE_PCT * equity - fresh_exposure)
+                sto_size = min(settings.SUM_TO_ONE_MAX_POSITION_PCT * equity, headroom, cash)
+                if sto_size < self.broker.min_order_size_usd * 2:
+                    continue
+
+                try:
+                    yes_fill, no_fill = await self.broker.place_sum_to_one_order(sto, sto_size)
+                    await self.alerter.send_alert(
+                        f"[{self.broker.mode}] Sum-to-one {market.asset} "
+                        f"'{market.question[:44]}' ${sto_size:.2f} "
+                        f"(YES {yes_fill.avg_price:.3f} + NO {no_fill.avg_price:.3f}, "
+                        f"locked edge {sto.net_profit_pct:.2%})",
+                        level=AlertLevel.INFO,
+                    )
+                except SumToOneEdgeLostError as e:
+                    # Edge vanished between detection and fill; both legs were
+                    # reversed by the broker. Normal market condition, not a bug.
+                    logger.info("Sum-to-one %s skipped: %s", market.market_id, e)
+                except Exception:
+                    logger.exception("Sum-to-one order failed for market %s", market.market_id)
+                return  # one risk-free entry per cycle is enough
+
     async def _trading_loop(self) -> None:
         while not self._shutdown.is_set():
             try:
@@ -572,7 +671,10 @@ class TradingApp:
         equity = cash
         total_exposure = 0.0
         if isinstance(self.broker, PaperBroker):
-            equity = await self.broker.get_equity(self._known_markets)
+            # Merged market map: price open positions in BOTH the directional
+            # universe and the sum-to-one universe (positions whose market
+            # isn't in the map fall back to cost basis).
+            equity = await self.broker.get_equity({**self._known_markets, **self._sto_markets})
             total_exposure = await self.broker.get_total_exposure_usd()
 
         await self.risk.update(equity)
@@ -588,6 +690,12 @@ class TradingApp:
             logger.info("Skipping new entries: reason=trading_paused")
             await self._check_early_exits(equity)
             return
+
+        # Lever 1: the risk-free sum-to-one scan runs across ALL binary
+        # categories (not just the BTC/ETH directional universe) and runs
+        # BEFORE the directional pass — arithmetic, not prediction, and it
+        # matters most when crypto windows are quiet.
+        await self._scan_sum_to_one_universe(equity, cash)
 
         markets = list(self._known_markets.values())
         if not markets:
@@ -834,7 +942,10 @@ class TradingApp:
         equity = cash
         total_exposure = 0.0
         if isinstance(self.broker, PaperBroker):
-            equity = await self.broker.get_equity(self._known_markets)
+            # Merged market map: price open positions in BOTH the directional
+            # universe and the sum-to-one universe (positions whose market
+            # isn't in the map fall back to cost basis).
+            equity = await self.broker.get_equity({**self._known_markets, **self._sto_markets})
             total_exposure = await self.broker.get_total_exposure_usd()
         headroom = max(0.0, settings.MAX_TOTAL_EXPOSURE_PCT * equity - total_exposure)
         if headroom <= 0:

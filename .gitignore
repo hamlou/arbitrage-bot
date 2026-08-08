@@ -4,6 +4,7 @@ storage/*.db
 storage/*.db-shm
 storage/*.db-wal
 storage/*.db-journal
+storage/*.lock
 storage/*.log
 *.log
 # Archived DBs from debug/pre-run snapshots — raw trade data, never pushed

@@ -28,12 +28,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Polymarket's taker fee RATE (fee coefficient Theta). VERIFIED 2026-08-08
-# against https://docs.polymarket.us/fees ("Fee Schedule - Polymarket US
-# Documentation", effective 12 AM ET Wednesday July 1, 2026): "Fees are
-# computed using a symmetric formula that scales with price uncertainty:
-# Fee = Theta x C x p x (1 - p)" with Theta (taker) = 0.06 and maker rebate
-# -0.0125. Applied as fee_rate * p * (1 - p) per share.
+# Polymarket's taker fee RATE (fee coefficient Theta). BEST-AVAILABLE
+# ESTIMATE (2026-08-08), not settled fact: the formula shape is verified
+# (docs.polymarket.us/fees, effective 2026-07-01: "Fee = Theta x C x p x
+# (1 - p)", Theta = 0.06 taker / -0.0125 maker rebate), but third-party
+# sources for the same period cite 0.07 (some with an exponent), and the
+# bot's venue is the global Polymarket.com whose authoritative fee page we
+# could not load. 0.06 is our best available estimate; revisit before live
+# trading and prefer the higher value if uncertainty persists.
+# Applied as fee_rate * p * (1 - p) per share.
 DEFAULT_TAKER_FEE_RATE = 0.06
 
 

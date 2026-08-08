@@ -561,3 +561,131 @@ async def test_binance_reconnect_callback_fires_after_drop():
 async def _collect_updates(feed) -> None:
     async for _ in feed.stream():
         pass
+
+
+async def test_discover_binary_markets_includes_non_crypto_categories():
+    """Lever 1 (2026-08-08): the risk-free sum-to-one scan must not be
+    confined to crypto up/down. discover_binary_markets must accept any
+    binary (2-outcome) market — politics, sports, geopolitics — that meets
+    liquidity and horizon, and must drop multi-outcome and thin markets."""
+    now = time.time()
+
+    def iso(offset_s: float) -> str:
+        return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    politics = {
+        "id": "p1",
+        "question": "Will the bill pass before September?",
+        "clobTokenIds": ["tp_yes", "tp_no"],
+        "liquidity": "12000",
+        "endDate": iso(3600),
+        "closed": False,
+    }
+    sports = {
+        "id": "s1",
+        "question": "Will Team A beat Team B?",
+        "clobTokenIds": ["ts_yes", "ts_no"],
+        "liquidity": "9000",
+        "endDate": iso(7200),
+        "closed": False,
+    }
+    # Multi-outcome market (e.g. "who wins the election") — NOT binary.
+    multi = {
+        "id": "m1",
+        "question": "Which candidate wins?",
+        "clobTokenIds": ["c1", "c2", "c3"],
+        "liquidity": "50000",
+        "endDate": iso(3600),
+        "closed": False,
+    }
+    # Thin binary market below the liquidity floor.
+    thin = {
+        "id": "t1",
+        "question": "Will it rain tomorrow?",
+        "clobTokenIds": ["tr_yes", "tr_no"],
+        "liquidity": "300",
+        "endDate": iso(3600),
+        "closed": False,
+    }
+    # A crypto up/down window also parses as a generic binary market — it
+    # lands in the sto universe too, but main.py dedupes against the
+    # directional universe by market_id.
+    crypto = {
+        "id": "c1",
+        "question": "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET",
+        "clobTokenIds": ["tb_yes", "tb_no"],
+        "liquidity": "25000",
+        "endDate": iso(300),
+        "closed": False,
+    }
+
+    payload = {
+        "events": [
+            _keyset_event(politics, "ep"),
+            _keyset_event(sports, "es"),
+            _keyset_event(multi, "em"),
+            _keyset_event(thin, "et"),
+            _keyset_event(crypto, "ec"),
+        ],
+        "next_cursor": None,
+    }
+
+    async def fake_gamma_get(path, params=None):
+        return payload
+
+    feed = PolymarketFeed(min_liquidity_usd=1_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_binary_markets(
+        min_liquidity_usd=500.0, lookahead_s=24 * 3600,
+    )
+
+    ids = sorted(m.market_id for m in markets)
+    assert ids == ["c1", "p1", "s1"]  # multi-outcome and thin binary dropped
+    by_id = {m.market_id: m for m in markets}
+    assert by_id["p1"].asset == "?"  # generic parser marks non-crypto
+    assert by_id["p1"].duration_minutes is None
+    assert by_id["s1"].token_id_yes == "ts_yes"
+    assert by_id["c1"].token_id_yes == "tb_yes"
+
+
+async def test_discover_binary_markets_respects_horizon_and_pages():
+    """Markets ending beyond the lookahead horizon must be dropped, and the
+    keyset call must NOT carry the up-or-down tag (that's the whole point of
+    the wider scan)."""
+    now = time.time()
+
+    def iso(offset_s: float) -> str:
+        return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    captured = {}
+    pages = iter([
+        {
+            "events": [
+                _keyset_event({
+                    "id": "a1", "question": "Q1",
+                    "clobTokenIds": ["a_yes", "a_no"], "liquidity": "9000",
+                    "endDate": iso(3600), "closed": False,
+                }, "ea"),
+                _keyset_event({
+                    "id": "b1", "question": "Q2",
+                    "clobTokenIds": ["b_yes", "b_no"], "liquidity": "9000",
+                    "endDate": iso(3 * 86400), "closed": False,  # ends in 3 days
+                }, "eb"),
+            ],
+            "next_cursor": "cursor-1",
+        },
+        {"events": [], "next_cursor": None},
+    ])
+
+    async def fake_gamma_get(path, params=None):
+        captured["params"] = params
+        return next(pages)
+
+    feed = PolymarketFeed(min_liquidity_usd=1_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_binary_markets(
+        min_liquidity_usd=500.0, lookahead_s=24 * 3600, max_pages=2,
+    )
+
+    assert "tag_slug" not in captured["params"]
+    assert [m.market_id for m in markets] == ["a1"]  # 3-day market outside 24h horizon

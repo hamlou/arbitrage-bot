@@ -78,15 +78,21 @@ class Settings(BaseSettings):
     # p=0.80). A taker round trip pays it twice, so at p~0.5 the fee hurdle
     # is ~6% of notional before spread. All fee math lives in engine/fees.py;
     # this setting is the single source of truth for the RATE.
-    # VERIFIED 2026-08-08 against https://docs.polymarket.us/fees ("Fee
-    # Schedule - Polymarket US Documentation", effective 12 AM ET Wednesday
-    # July 1, 2026): "Fees are computed using a symmetric formula that scales
-    # with price uncertainty: Fee = Theta x C x p x (1 - p)", with Theta
-    # (taker fee coefficient) = 0.06, maker rebate = -0.0125. Prior value
-    # 0.07 came from a less precise source and OVERSTATED the coefficient by
-    # ~17% — the safe direction, but it throttled marginal trades that would
-    # actually clear fees. The flat 2% assumption (pre-2026-08-07)
-    # UNDERSTATED mid-price fees — paper results looked better than live.
+    # BEST-AVAILABLE ESTIMATE, not settled fact (documented honestly
+    # 2026-08-08): the formula SHAPE is verified — "Fees are computed using a
+    # symmetric formula that scales with price uncertainty: Fee = Theta x C x
+    # p x (1 - p)" (docs.polymarket.us/fees, effective 2026-07-01, Theta =
+    # 0.06 taker / -0.0125 maker rebate). The exact RATE is disputed across
+    # sources: the official .us docs say 0.06; multiple third-party write-ups
+    # of the same period cite 0.07 (some with an exponent). The bot trades
+    # the GLOBAL platform (Polymarket.com), whose fee page we could not load
+    # authoritatively, so 0.06 is our best available estimate of the rate —
+    # revisit before any live trading, and prefer the higher value if
+    # uncertainty persists (understating costs is the dangerous direction).
+    # Either way the conclusion holds: mid-price (~0.50) round trips face a
+    # real fee wall; extreme-price entries face a much smaller one. The flat
+    # 2% assumption (pre-2026-08-07) UNDERSTATED mid-price fees — paper
+    # results looked better than live.
     TAKER_FEE_PCT: float = 0.06
     # Cross-exchange sanity gate: before firing a signal, the latest known
     # Binance and Coinbase prices for the asset must agree within this many
@@ -181,6 +187,19 @@ class Settings(BaseSettings):
     # than sharing Kelly sizing with the directional strategy.
     SUM_TO_ONE_MIN_EDGE_PCT: float = 0.01
     SUM_TO_ONE_MAX_POSITION_PCT: float = 0.10
+    # --- Sum-to-one universe (Lever 1, added 2026-08-08) ------------------
+    # The sum-to-one check is arithmetic and works on ANY binary market, but
+    # discovery was confined to crypto up/down (tag_slug=up-or-down) — the
+    # single most fee-heavy, most latency-bot-crowded corner of the platform.
+    # This flag widens the risk-free scan to all binary categories (politics,
+    # sports, geopolitics, long-duration crypto...), where several categories
+    # are cheaper or fee-free. The DIRECTIONAL universe stays BTC/ETH-only;
+    # only the sum-to-one scan consumes this list.
+    SUM_TO_ONE_DISCOVERY_ENABLED: bool = True
+    SUM_TO_ONE_DISCOVERY_MIN_LIQUIDITY_USD: float = 500.0
+    SUM_TO_ONE_DISCOVERY_LOOKAHEAD_S: float = 24 * 3600  # markets ending within 24h
+    SUM_TO_ONE_DISCOVERY_MAX_MARKETS: int = 60           # cap book-polling load
+    SUM_TO_ONE_DISCOVERY_MAX_PAGES: int = 5
 
     # --- Market discovery -----------------------------------------------
     # Decoupled from the (much faster) per-cycle signal evaluation loop — no
