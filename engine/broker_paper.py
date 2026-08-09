@@ -50,19 +50,23 @@ class OrderTooSmallError(Exception):
 class SumToOneEdgeLostError(Exception):
     """
     Raised by place_sum_to_one_order when the combined fill price of the two
-    legs no longer locks a profit. The opportunity was detected against
-    best asks at decision time, but the fills include the simulated fill
-    latency and real book walking — and by the time both legs land, the
-    combined cost can be at or above $1 (verified 2026-08-07: fills at
-    0.31+0.73=1.04 and 0.17+0.89=1.06 — a guaranteed LOSS, not an arb). The
-    broker reverses both legs before raising, so a "guaranteed" pair is
-    never held as a guaranteed loss.
+    legs no longer locks a profit. Two distinct triggers: (1) the PRE-QUOTE
+    guard — the real ask-walk of both legs (what the fills would actually
+    pay) exceeds $1 even though the best asks summed below it, so nothing is
+    opened (live 2026-08-09: best asks looked cheap but fills walked to
+    0.86+0.15=1.01 — a guaranteed LOSS that the reversal then amplified to
+    −$46.72); (2) the fills themselves land at or above $1 after the book
+    moved during the fill latency (verified 2026-08-07: 0.31+0.73=1.04,
+    0.17+0.89=1.06). In case (2) the broker reverses BOTH legs only when
+    reversing loses less than holding to settlement (see
+    _resolve_edge_loss), so a "guaranteed" pair is never held as a large
+    guaranteed loss.
     """
 
-    def __init__(self, combined_cost: float, locked_edge_pct: float):
+    def __init__(self, combined_cost: float, locked_edge_pct: float, action: str = "both legs reversed"):
         super().__init__(
-            f"Sum-to-one edge evaporated at fill: combined cost {combined_cost:.3f} "
-            f"(locked edge {locked_edge_pct:.2%}) — both legs reversed"
+            f"Sum-to-one edge not locked: combined cost {combined_cost:.3f} "
+            f"(locked edge {locked_edge_pct:.2%}) — {action}"
         )
         self.combined_cost = combined_cost
         self.locked_edge_pct = locked_edge_pct
@@ -379,16 +383,49 @@ class PaperBroker:
         combo_group_id = str(uuid.uuid4())
         half = total_size_usd / 2
 
-        # Pre-check the TOTAL cost (both legs + price-dependent fees) BEFORE
-        # opening either leg. Two reasons (reviewed 2026-08-07): (1) with
-        # concurrent legs, two per-leg balance checks could each pass while
-        # the combined cost exceeds the balance — the total must be validated
-        # up front; (2) sequentially, the second leg could raise
-        # InsufficientBalanceError after the first already opened, leaving a
-        # HALF-OPEN hedge that the edge-revalidation below never sees. Each
-        # leg is half the size, so total fee = half*(fee(yes_ask) + fee(no_ask)).
-        fee_yes = half * fees.taker_fee_fraction_of_notional(opportunity.yes_ask, self.fee_pct)
-        fee_no = half * fees.taker_fee_fraction_of_notional(opportunity.no_ask, self.fee_pct)
+        # (1) QUOTE the real fills BEFORE opening anything. The opportunity
+        # was detected against best asks (find_sum_to_one_opportunity), but
+        # each leg fills by WALKING the ask side — on a thin book the walked
+        # combined cost can exceed $1 even when the best asks sum below it
+        # (live 2026-08-09: fills at 0.86+0.15=1.01 — a guaranteed loss that
+        # the reversal then amplified to −$46.72). Refuse to place at all
+        # when the real walk no longer locks a profit: never open a
+        # guaranteed-losing combo.
+        quoted = await self._quote_sum_to_one_fills(opportunity.market, half, book_source)
+        if quoted is None:
+            raise SumToOneEdgeLostError(
+                0.0, 0.0,
+                action="refused before placing — insufficient book depth to fill both legs",
+            )
+        quoted_cost = quoted[0] + quoted[1]
+        quoted_fee_cost = (
+            fees.taker_fee_pct(quoted[0], self.fee_pct)
+            + fees.taker_fee_pct(quoted[1], self.fee_pct)
+        )
+        quoted_edge = (1.0 - quoted_cost) - quoted_fee_cost
+        if quoted_edge <= 0:
+            logger.warning(
+                "Sum-to-one %s refused before placing: walked fills %.3f+%.3f=%.3f "
+                "(edge %.2f%%) — best asks looked under $1 but the real ask-walk does not",
+                opportunity.market.market_id, quoted[0], quoted[1], quoted_cost, quoted_edge * 100,
+            )
+            raise SumToOneEdgeLostError(
+                quoted_cost, quoted_edge,
+                action="refused before placing — the real fill walk exceeds $1",
+            )
+
+        # (2) Pre-check the TOTAL cost (both legs + price-dependent fees on
+        # the QUOTED fill prices) BEFORE opening either leg. Two reasons
+        # (reviewed 2026-08-07): (1) with concurrent legs, two per-leg
+        # balance checks could each pass while the combined cost exceeds the
+        # balance — the total must be validated up front; (2) sequentially,
+        # the second leg could raise InsufficientBalanceError after the
+        # first already opened, leaving a HALF-OPEN hedge that the
+        # edge-revalidation below never sees. Each leg is half the size, so
+        # total fee = half*(fee(yes_fill) + fee(no_fill)) at the QUOTED
+        # prices.
+        fee_yes = half * fees.taker_fee_fraction_of_notional(quoted[0], self.fee_pct)
+        fee_no = half * fees.taker_fee_fraction_of_notional(quoted[1], self.fee_pct)
         total_cost = total_size_usd + fee_yes + fee_no
         if total_cost > self.balance_usd:
             raise InsufficientBalanceError(
@@ -457,21 +494,112 @@ class PaperBroker:
         )
         locked_edge_pct = (1.0 - combined_cost) - fee_cost
         if locked_edge_pct <= 0:
-            # The "arbitrage" is gone — reverse both legs immediately at the
-            # current book so we never hold a guaranteed-losing pair to
-            # settlement. The realized loss here is just the spread cost of
-            # the failed attempt, which is exactly what paper mode should
-            # surface. Best-effort: if a leg can't be exited (no bid depth),
-            # it stays open and settlement will resolve it normally.
+            # The "arbitrage" is gone at fill — but reversing is NOT
+            # automatically the right move: it sells both legs into the
+            # current bids, whose spread cost can far exceed the cost of
+            # holding the pair to settlement (live 2026-08-09: fills at 1.01,
+            # reversal sold at 0.865 → −$46.72, while the worst-case hold
+            # loss was similar and the best case profitable). _resolve_edge_loss
+            # reverses only when it loses LESS than holding; otherwise it
+            # holds to settlement, where the pair resolves normally.
+            action = await self._resolve_edge_loss(
+                opportunity.market, yes_fill, no_fill, combo_group_id,
+            )
+            raise SumToOneEdgeLostError(combined_cost, locked_edge_pct, action=action)
+
+        return yes_fill, no_fill
+
+    async def _quote_sum_to_one_fills(
+        self, market: Market, half_size_usd: float, book_source: Optional[object],
+    ) -> Optional[tuple[float, float]]:
+        """
+        Walk BOTH legs' ask sides and return the average fill price each leg
+        would ACTUALLY get for half_size_usd, or None if either book cannot
+        absorb its leg. This is the pre-place guard: the decision sees best
+        asks (which can sum below $1) while the fill walks the whole ask
+        side (which on a thin book sums above $1). Quote the real walk so a
+        guaranteed-losing combo is never opened in the first place.
+        """
+        async def _book(token_id: str) -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        try:
+            yes_avg, _ = self._walk_book_for_fill(await _book(market.token_id_yes), half_size_usd)
+            no_avg, _ = self._walk_book_for_fill(await _book(market.token_id_no), half_size_usd)
+        except ValueError:
+            return None
+        return yes_avg, no_avg
+
+    async def _quote_reversal_net(self, market: Market, fill: Fill) -> Optional[float]:
+        """
+        Net-of-exit-fee proceeds a reversal of `fill` would realize at the
+        current bid side, or None if the bid side cannot absorb the whole
+        leg (in which case a clean reversal is impossible).
+        """
+        token_id = market.token_id_yes if fill.side == "YES" else market.token_id_no
+        try:
+            book = await self.feed.get_order_book(market.market_id, token_id)
+        except Exception:
+            return None
+        shares = fill.size_usd / fill.avg_price if fill.avg_price else 0.0
+        price, filled = self._walk_book_for_sale(book, shares)
+        if filled <= 0 or filled < shares - 1e-9:
+            return None
+        proceeds = filled * price
+        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(price, self.fee_pct)
+        return proceeds - exit_fee
+
+    async def _resolve_edge_loss(
+        self, market: Market, yes_fill: Fill, no_fill: Fill, combo_group_id: str,
+    ) -> str:
+        """
+        Post-fill edge-loss fallback: decide between reversing both legs now
+        and holding the pair to settlement — whichever loses LESS.
+
+        Holding's worst case is known: only the CHEAPER side's shares pay $1
+        at settlement (equal-dollar sizing leaves unequal share counts), so
+        the worst-case hold PnL is min(shares_yes, shares_no) − entry cost.
+        Reversing's PnL is the current bid-side walk of both legs, net of
+        exit fees. On thin books the reversal spread cost is usually the
+        larger loss (live 2026-08-09: fills at 1.01, reversal sold at 0.865
+        → −$46.72), so reversal is only taken when it is strictly better
+        than the worst-case hold. If either leg can't be fully sold, holding
+        is forced.
+
+        Returns a short action description for the caller's exception.
+        """
+        yes_shares = yes_fill.size_usd / yes_fill.avg_price if yes_fill.avg_price else 0.0
+        no_shares = no_fill.size_usd / no_fill.avg_price if no_fill.avg_price else 0.0
+        entry_cost = yes_fill.size_usd + no_fill.size_usd + yes_fill.fee_usd + no_fill.fee_usd
+        hold_worst_pnl = min(yes_shares, no_shares) - entry_cost
+
+        reversal_pnl: Optional[float] = None
+        net_proceeds = 0.0
+        for fill in (yes_fill, no_fill):
+            leg_net = await self._quote_reversal_net(market, fill)
+            if leg_net is None:
+                reversal_pnl = None
+                break
+            net_proceeds += leg_net
+        else:
+            # Convert gross proceeds to net PnL on the SAME basis as
+            # hold_worst_pnl (net of the entry cost of both legs).
+            reversal_pnl = net_proceeds - entry_cost
+
+        if reversal_pnl is not None and reversal_pnl > hold_worst_pnl:
             logger.warning(
-                "Sum-to-one edge evaporated at fill: combined %.3f (locked %.2f%%) "
-                "— reversing both legs of combo %s",
-                combined_cost, locked_edge_pct * 100, combo_group_id,
+                "Sum-to-one edge lost at fill for combo %s: reversal PnL $%.2f beats "
+                "worst-case hold $%.2f — reversing both legs",
+                combo_group_id, reversal_pnl, hold_worst_pnl,
             )
             for fill in (yes_fill, no_fill):
                 try:
                     pnl = await self.close_position_early(
-                        opportunity.market, fill.trade_id, reason="SUM_TO_ONE_EDGE_LOST",
+                        market, fill.trade_id, reason="SUM_TO_ONE_EDGE_LOST",
                     )
                 except Exception:
                     logger.exception("Failed to reverse sum-to-one leg %d after edge loss", fill.trade_id)
@@ -479,12 +607,18 @@ class PaperBroker:
                     if pnl is None:
                         logger.warning(
                             "Sum-to-one leg %d could NOT be reversed after edge loss "
-                            "(no bid depth) — half-open hedge remains on %s",
-                            fill.trade_id, opportunity.market.market_id,
+                            "(no full bid depth) — holding to settlement",
+                            fill.trade_id,
                         )
-            raise SumToOneEdgeLostError(combined_cost, locked_edge_pct)
+            return "both legs reversed"
 
-        return yes_fill, no_fill
+        logger.warning(
+            "Sum-to-one edge lost at fill for combo %s: holding to settlement "
+            "(worst-case hold PnL $%.2f vs reversal PnL %s) — the pair resolves normally",
+            combo_group_id, hold_worst_pnl,
+            f"${reversal_pnl:.2f}" if reversal_pnl is not None else "n/a (no full bid depth)",
+        )
+        return "both legs held to settlement"
 
     async def cancel_order(self, order_id: str) -> bool:
         """

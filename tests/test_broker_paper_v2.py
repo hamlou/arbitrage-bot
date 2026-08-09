@@ -26,6 +26,29 @@ class FakeFeed:
         return self._outcome
 
 
+class MovingFeed:
+    """FakeFeed variant whose books CHANGE after the first calls per token:
+    the pre-place quote and the decision read the GOOD book; the fill (and a
+    later reversal quote) read the BAD book. Mirrors the live 2026-08-07/09
+    failures where the decision saw a < $1 combo and the fills landed at
+    >= $1 because the book moved during the fill latency."""
+
+    def __init__(self, good: dict[str, OrderBook], bad: dict[str, OrderBook], good_for_first_n: int = 2):
+        self._good = good
+        self._bad = bad
+        self._good_for_first_n = good_for_first_n
+        self._calls: dict[str, int] = {}
+
+    async def get_order_book(self, market_id: str, token_id: str) -> OrderBook:
+        self._calls[token_id] = self._calls.get(token_id, 0) + 1
+        if self._calls[token_id] <= self._good_for_first_n:
+            return self._good[token_id]
+        return self._bad[token_id]
+
+    async def get_market_outcome(self, market_id: str) -> str | None:
+        return None
+
+
 def make_market(market_id="m1") -> Market:
     return Market(
         market_id=market_id, question="Bitcoin Up or Down - 15 min",
@@ -251,51 +274,109 @@ async def test_sum_to_one_prechecks_total_cost_no_half_open_hedge(db):
     assert broker.balance_usd == pytest.approx(101)
 
 
-async def test_sum_to_one_reverses_when_edge_evaporates_at_fill(db):
+async def test_sum_to_one_refuses_when_real_walk_exceeds_1(db):
     """
-    Regression test for the 2026-08-07 loss: the opportunity was detected
-    against best asks (< $1 combined), but the fills land after the simulated
-    fill latency against a book that kept moving — the combined fill cost can
-    be >= $1 (verified live: 0.31+0.73=1.04, 0.17+0.89=1.06). When that
-    happens the "arbitrage" is a guaranteed loss, so BOTH legs must be
-    reversed immediately and SumToOneEdgeLostError raised — never held to
-    settlement as a losing "guaranteed win".
+    The pre-place quote guard: best asks can sum below $1 while the real
+    ask-WALK (what the fills would ACTUALLY pay on a thin book) sums above
+    it. The combo must be refused BEFORE any leg opens — never place a
+    guaranteed-losing pair (live 2026-08-09: fills at 0.86+0.15=1.01 — a
+    guaranteed loss that the reversal then amplified to −$46.72).
     """
-    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
-             "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    yes_book = OrderBook(
+        market_id="m1", token_id="tok_yes",
+        bids=(OrderBookLevel(price=0.40, size=1000),),
+        asks=(OrderBookLevel(price=0.46, size=10), OrderBookLevel(price=0.90, size=1000)),
+    )
+    no_book = OrderBook(
+        market_id="m1", token_id="tok_no",
+        bids=(OrderBookLevel(price=0.40, size=1000),),
+        asks=(OrderBookLevel(price=0.48, size=10), OrderBookLevel(price=0.50, size=1000)),
+    )
+    books = {"tok_yes": yes_book, "tok_no": no_book}
     feed = FakeFeed(books)
     market = make_market()
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
 
-    # 0.3s simulated latency between decision and fill, during which the book
-    # drifts so combined cost crosses $1.
+    # Detected against BEST asks (0.46 + 0.48 = 0.94 < $1)...
+    opp = find_sum_to_one_opportunity(market, yes_book, no_book, min_edge_pct=0.01, fee_pct=0.0)
+    assert opp is not None
+
+    # ...but the real walk (10 shares of depth at the best ask, the rest at
+    # 0.90/0.50) costs ~1.33 — refused before opening anything.
+    with pytest.raises(SumToOneEdgeLostError):
+        await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    assert await db.get_open_trades(mode="PAPER") == []
+    assert broker.balance_usd == pytest.approx(1000)  # nothing debited
+
+
+async def test_sum_to_one_reverses_when_edge_evaporates_at_fill(db):
+    """
+    Regression test for the 2026-08-07 loss: the quote/decision see a < $1
+    combo, but the fills land after the simulated fill latency against a
+    book that kept moving — the combined fill cost crosses $1 (verified
+    live: 0.31+0.73=1.04, 0.17+0.89=1.06). When REVERSING loses LESS than
+    holding to settlement (bids stayed near the asks), both legs are
+    reversed immediately and SumToOneEdgeLostError raised — never held as a
+    large guaranteed loss.
+    """
+    good = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+            "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    # Book moves before the fills land: asks cross $1 (0.54 + 0.52 = 1.06)
+    # while bids stay near them, so a reversal is cheaper than holding.
+    bad = {"tok_yes": make_symmetric_book("tok_yes", best_bid=0.52, best_ask=0.54),
+           "tok_no": make_symmetric_book("tok_no", best_bid=0.50, best_ask=0.52)}
+    feed = MovingFeed(good, bad, good_for_first_n=2)
+    market = make_market()
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
                          simulated_fill_latency_s=0.3)
 
     opp = find_sum_to_one_opportunity(
-        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.0,
+        market, good["tok_yes"], good["tok_no"], min_edge_pct=0.01, fee_pct=0.0,
     )
     assert opp is not None  # detected as a genuine < $1 opportunity
-
-    # The book moves before the fills land: YES ask 0.46 -> 0.52, NO 0.48 -> 0.50
-    # (combined 1.02 >= 1.00 — edge gone).
-    def moving_book(token_id: str):
-        if token_id == "tok_yes":
-            return make_symmetric_book(token_id, best_ask=0.52)
-        return make_symmetric_book(token_id, best_ask=0.50)
-
-    async def fetch(_, token_id: str):
-        return moving_book(token_id)
-
-    import types
-    broker.feed = types.SimpleNamespace(get_order_book=fetch, get_market_outcome=feed.get_market_outcome)
 
     with pytest.raises(SumToOneEdgeLostError):
         await broker.place_sum_to_one_order(opp, total_size_usd=100)
 
-    # Both legs must have been reversed — no open positions remain.
+    # Reversal was the cheaper option — both legs reversed, none remain.
     assert not broker.has_open_position("m1")
     open_trades = await db.get_open_trades(mode="PAPER")
     assert open_trades == []
+
+
+async def test_sum_to_one_holds_when_reversal_loses_more_than_holding(db):
+    """
+    When the fills cross $1 but the current bids have collapsed (thin
+    book), REVERSING loses more than holding to settlement — the pair must
+    be HELD (both legs stay open, the combo resolves normally) rather than
+    reversed into a deeper loss (live 2026-08-09: fills at 1.01, reversal
+    sold at 0.865 → −$46.72).
+    """
+    good = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+            "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    # Asks moved up (fills cross $1) AND bids collapsed — reversing is far
+    # worse than the worst-case hold.
+    bad = {"tok_yes": make_symmetric_book("tok_yes", best_bid=0.40, best_ask=0.52),
+           "tok_no": make_symmetric_book("tok_no", best_bid=0.40, best_ask=0.50)}
+    feed = MovingFeed(good, bad, good_for_first_n=2)
+    market = make_market()
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
+                         simulated_fill_latency_s=0.3)
+
+    opp = find_sum_to_one_opportunity(
+        market, good["tok_yes"], good["tok_no"], min_edge_pct=0.01, fee_pct=0.0,
+    )
+    assert opp is not None
+
+    with pytest.raises(SumToOneEdgeLostError):
+        await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    # Held to settlement: both legs still open, same combo_group_id.
+    open_trades = await db.get_open_trades(mode="PAPER")
+    assert len(open_trades) == 2
+    assert len({t["combo_group_id"] for t in open_trades}) == 1
+    assert broker.has_open_position("m1")
 
 
 async def test_sum_to_one_held_when_edge_survives_fill(db):

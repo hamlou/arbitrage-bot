@@ -634,8 +634,9 @@ class TradingApp:
                         level=AlertLevel.INFO,
                     )
                 except SumToOneEdgeLostError as e:
-                    # Edge vanished between detection and fill; both legs were
-                    # reversed by the broker. Normal market condition, not a bug.
+                    # The combo's real fill walk no longer locked a profit —
+                    # the broker refused to place, or reversed/held per the
+                    # reverse-vs-hold decision. Normal market condition, not a bug.
                     logger.info("Sum-to-one %s skipped: %s", market.market_id, e)
                 except Exception:
                     logger.exception("Sum-to-one order failed for market %s", market.market_id)
@@ -811,10 +812,11 @@ class TradingApp:
                                     level=AlertLevel.INFO,
                                 )
                             except SumToOneEdgeLostError as e:
-                                # The combo edge vanished between detection and
-                                # fill; both legs were already reversed by the
-                                # broker. This is a normal market condition, not
-                                # a bug — log at INFO, never alert.
+                                # The combo's real fill walk no longer locked
+                                # a profit — the broker refused to place, or
+                                # reversed/held per the reverse-vs-hold
+                                # decision. Normal market condition, not a bug
+                                # — log at INFO, never alert.
                                 logger.info("Sum-to-one %s skipped: %s", market.market_id, e)
                             except Exception:
                                 logger.exception("Sum-to-one order failed for market %s", market.market_id)
