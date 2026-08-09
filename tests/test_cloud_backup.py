@@ -199,6 +199,11 @@ async def test_restore_fresh_reply(tmp_path):
     )
     assert await cloud_backup.restore_if_needed(db, "TOK", "CHAT", timeout_s=5, client=client) == "fresh"
     assert not db.exists()
+    # The user must get a confirmation that "fresh" was received — previously
+    # this returned silently and the user thought it didn't work.
+    confirms = [c for c in client.calls if c[0] == "post" and "sendMessage" in c[1]]
+    assert len(confirms) == 2  # the restore prompt + the confirmation
+    assert "fresh" in confirms[1][2]["data"]["text"].lower()
 
 
 async def test_restore_timeout(tmp_path):
@@ -207,6 +212,9 @@ async def test_restore_timeout(tmp_path):
     outcome = await cloud_backup.restore_if_needed(db, "TOK", "CHAT", timeout_s=0.3, client=client)
     assert outcome == "timeout"
     assert not db.exists()
+    # The user must be told the window closed and a fresh account was started.
+    confirms = [c for c in client.calls if c[0] == "post" and "sendMessage" in c[1]]
+    assert len(confirms) == 2  # the restore prompt + the timeout notice
 
 
 async def test_restore_without_telegram_starts_fresh(tmp_path):

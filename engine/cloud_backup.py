@@ -202,6 +202,32 @@ async def _download_file(
     return dl.content
 
 
+async def _send_confirm(client: httpx.AsyncClient, bot_token: str, chat_id: str, which: str) -> None:
+    """Send the user a confirmation that their restore choice was received.
+    Best-effort: a failure here must never break the boot path."""
+    if which == "fresh":
+        text = (
+            "✅ Got it — starting a <b>fresh</b> $1,000 paper account. "
+            "The bot is booting now; you'll see the status menu shortly."
+        )
+    else:
+        text = (
+            "⏰ No backup arrived within the restore window, so I'm starting a "
+            "<b>fresh</b> $1,000 paper account. (If you meant to restore, "
+            "forward the latest <b>arb_bot_backup.db</b> — I'll still pick "
+            "it up on the next restart.)"
+        )
+    try:
+        r = await client.post(
+            f"{API_BASE}/bot{bot_token}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+    except Exception:
+        logger.exception("Failed to send restore confirmation (%s)", which)
+
+
 async def restore_if_needed(
     db_path: Path,
     bot_token: Optional[str],
@@ -276,8 +302,14 @@ async def restore_if_needed(
                     return "corrupt"
                 text = (msg.get("text") or "").strip().lower()
                 if text in {"fresh", "/fresh", "start fresh", "fresh start"}:
+                    # Confirm immediately — the user typed the word and got
+                    # nothing back before, which reads as "it didn't work."
+                    await _send_confirm(client, bot_token, chat_id, "fresh")
                     return "fresh"
             await asyncio.sleep(1.0)
+        # The restore window closed without a usable reply: tell the user we
+        # are starting fresh anyway so they aren't left wondering.
+        await _send_confirm(client, bot_token, chat_id, "timeout")
         return "timeout"
     finally:
         if own:
