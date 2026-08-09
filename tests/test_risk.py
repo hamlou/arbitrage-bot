@@ -72,6 +72,37 @@ async def test_hard_cap_triggers_on_large_edge(db):
     assert size == pytest.approx(settings.MAX_POSITION_PCT * 1000)
 
 
+async def test_momentum_fallback_signals_are_sized_at_discount(db):
+    """A signal from the ~52%-accurate momentum fallback must risk less than
+    an equal fair-value lean — the fallback does not deserve full Kelly."""
+    settings = make_settings(MAX_POSITION_PCT=0.08, MODEL_FALLBACK_SIZE_SCALE=0.5)
+    risk = RiskManager(settings, db, make_alerter())
+    await risk.load_state(current_balance=1000)
+
+    # edge 0.10 at p=0.50: odds=1.0, half-Kelly=0.05 -> $50 full, $25 discounted.
+    fv_signal = SignalForSizing(edge_pct=0.10, entry_price=0.5, model_used="fair_value")
+    fb_signal = SignalForSizing(edge_pct=0.10, entry_price=0.5, model_used="momentum_fallback")
+
+    fv_size = risk.position_size(fv_signal, current_balance=1000)
+    fb_size = risk.position_size(fb_signal, current_balance=1000)
+
+    assert fv_size == pytest.approx(50.0)
+    assert fb_size == pytest.approx(25.0)  # exactly MODEL_FALLBACK_SIZE_SCALE * fv_size
+
+
+async def test_model_defaults_to_fair_value_for_backwards_compat(db):
+    """Callers that omit model_used (older code, backtest harness) must get
+    full fair-value sizing, not the fallback discount."""
+    settings = make_settings(MODEL_FALLBACK_SIZE_SCALE=0.5)
+    risk = RiskManager(settings, db, make_alerter())
+    await risk.load_state(current_balance=1000)
+
+    signal = SignalForSizing(edge_pct=0.10, entry_price=0.5)  # model_used defaults
+    size = risk.position_size(signal, current_balance=1000)
+
+    assert size == pytest.approx(50.0)
+
+
 # -- Daily halt: trigger + persistence through restart ----------------------------
 
 async def test_daily_halt_triggers_on_breach(db):

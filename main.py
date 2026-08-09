@@ -829,7 +829,11 @@ class TradingApp:
                     return
 
                 size_usd = self.risk.position_size(
-                    SignalForSizing(edge_pct=signal.edge_pct, entry_price=yes_book.mid or 0.5),
+                    SignalForSizing(
+                        edge_pct=signal.edge_pct,
+                        entry_price=yes_book.mid or 0.5,
+                        model_used=signal.model_used,
+                    ),
                     current_balance=equity,
                 )
                 size_usd = min(size_usd, cash, exposure_headroom)

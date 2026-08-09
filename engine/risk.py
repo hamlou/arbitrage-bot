@@ -23,6 +23,8 @@ class SignalForSizing:
     """Minimal view of a signal needed for position sizing."""
     edge_pct: float       # e.g. 0.24 for a 24-point edge
     entry_price: float    # price of the side being bought, in (0, 1)
+    model_used: str = "fair_value"  # "fair_value" or "momentum_fallback" — the fallback
+                                    # is ~52%-accurate and must NOT be sized like the good model
 
 
 def _utc_day_key(ts: Optional[float] = None) -> str:
@@ -68,6 +70,20 @@ class RiskManager:
         with edge `edge_pct`: f* = edge / odds, where odds = (1 - p) / p is the
         net-profit-to-stake ratio of a winning $1 payout bought at price p.
         We take half of that, per the spec.
+
+        Why the classical formula still fits the round-trip (convergence) exit:
+        the "edge" here is the model-vs-market gap the bot banks by buying the
+        lagging side and selling after the repricing — the same edge/odds
+        relationship holds whether the exit is a reprice or a settlement
+        (the payout probability is the model's P(side wins the window)). It is
+        deliberately CONSERVATIVE for convergence bets, because the strategy
+        also pays fees + spread on the exit leg; the MAX_POSITION_PCT cap is
+        the binding constraint in practice.
+
+        Model-aware sizing: a signal from the momentum fallback (measured
+        ~52% accurate — barely better than a coin flip) must not be sized
+        like a fair-value read. MODEL_FALLBACK_SIZE_SCALE discounts its
+        fraction; only a REAL fair-value lean gets full Kelly.
         """
         if not (0 < signal.entry_price < 1):
             return 0.0
@@ -80,6 +96,8 @@ class RiskManager:
 
         full_kelly_fraction = signal.edge_pct / odds
         half_kelly_fraction = 0.5 * full_kelly_fraction
+        if signal.model_used == "momentum_fallback":
+            half_kelly_fraction *= self.settings.MODEL_FALLBACK_SIZE_SCALE
 
         # Never negative, never above the hard cap.
         capped_fraction = max(0.0, min(half_kelly_fraction, self.settings.MAX_POSITION_PCT))

@@ -32,6 +32,19 @@ class Settings(BaseSettings):
 
     # --- Risk parameters --------------------------------------------------
     MAX_POSITION_PCT: float = 0.08
+    # Discount applied to the half-Kelly fraction when the signal came from the
+    # momentum FALLBACK model instead of the fair-value model. The fallback is
+    # measured ~52%-accurate (calibration run 2026-08-08) — barely better than
+    # a coin flip — so it must never be sized like a real fair-value read.
+    # 0.5 = a fallback signal risks at most half of what an equal fair-value
+    # lean would risk. Pure risk control: does not change which signals fire.
+    MODEL_FALLBACK_SIZE_SCALE: float = 0.5
+    # Weight of the Coinbase side in the composite (blended) price the model
+    # reads: composite = BINANCE_WEIGHT * binance + (1 - BINANCE_WEIGHT) * coinbase.
+    # The blend only activates while BOTH feeds are fresh and agree within
+    # CROSS_EXCHANGE_TOLERANCE_PCT; otherwise the trustworthy side alone is
+    # used, so a disagreeing/stale feed can never poison the signal.
+    BINANCE_PRICE_WEIGHT: float = 0.5
     DAILY_LOSS_HALT_PCT: float = 0.20
     TOTAL_DRAWDOWN_KILL_PCT: float = 0.40
     # Total notional across ALL simultaneously open positions, as a fraction of

@@ -190,12 +190,56 @@ class SignalEngine:
             self._trackers[symbol] = SymbolMomentumTracker()
         return self._trackers[symbol]
 
+    def blended_price(self, symbol: str) -> Optional[float]:
+        """
+        The composite (blended) price the MODEL reads for a symbol.
+
+        Blends Binance and Coinbase into a volume-agnostic weighted average
+        (BINANCE_PRICE_WEIGHT) so a single exchange's wick or thin-book print
+        can't drive the model's z-score. The blend only activates while BOTH
+        feeds are fresh (within CROSS_EXCHANGE_MAX_AGE_S) AND agree within
+        CROSS_EXCHANGE_TOLERANCE_PCT — the same sanity the firing gate
+        enforces. If either condition fails, the trustworthy side alone is
+        used (Binance when fresh, else Coinbase), so a disagreeing or stale
+        feed can never poison the read. When NEITHER source has a fresh price
+        (bot just started, or the wall-clock gate can't judge), it falls back
+        to the Binance tracker's latest tick rather than going blind.
+        """
+        binance_px = self._fresh_latest_price("binance", symbol)
+        coinbase_px = self._fresh_latest_price("coinbase", symbol)
+        if binance_px is not None and coinbase_px is not None:
+            disagree = (
+                binance_px > 0
+                and abs(coinbase_px - binance_px) / binance_px * 100.0
+                > self.settings.CROSS_EXCHANGE_TOLERANCE_PCT
+            )
+            if not disagree:
+                w = self.settings.BINANCE_PRICE_WEIGHT
+                return w * binance_px + (1.0 - w) * coinbase_px
+            return binance_px  # disagreement — don't blend the untrustworthy side in
+        if binance_px is not None:
+            return binance_px
+        if coinbase_px is not None:
+            return coinbase_px  # Binance stale — a fresh Coinbase read beats a stale Binance one
+        # Neither source has a fresh price by the wall-clock gate (replay
+        # harnesses use synthetic timestamps; a live feed may be momentarily
+        # silent). Fall back to the Binance tracker's latest tick — the old
+        # behavior — so we never go blind when the gate simply can't judge.
+        # The engine's own tick-age guard (freshness in the confidence score)
+        # still protects live entry decisions.
+        tracker = self._trackers.get(symbol)
+        if tracker and tracker.latest:
+            return tracker.latest.price
+        return None
+
     def current_price(self, asset: str) -> Optional[float]:
-        """Latest known Binance price for an asset (e.g. "BTC") — used by
-        main.py's discovery loop to capture a new market's reference price
-        at first sighting."""
-        tracker = self._trackers.get(f"{asset}USDT")
-        return tracker.latest.price if tracker and tracker.latest else None
+        """Blended price for an asset (e.g. "BTC") — used by main.py's
+        discovery loop to capture a new market's reference price at first
+        sighting. Using the same blended basis as the model's current-price
+        input keeps reference and current on the SAME basis (a mismatch
+        there is exactly the "stale reference" failure the trust guard
+        exists for)."""
+        return self.blended_price(f"{asset}USDT")
 
     def latest_tick_received_at(self, asset: str) -> Optional[float]:
         """Wall-clock time the most recent Binance tick for an asset was
@@ -272,7 +316,12 @@ class SignalEngine:
         symbol = f"{market.asset}USDT"
         tracker = self._tracker_for(symbol)
         tick_age = tracker.tick_age_s()
-        current_price = tracker.latest.price if tracker.latest else None
+        # The model reads the BLENDED (Binance+Coinbase) price so a single
+        # exchange's wick can't drive the z-score; falls back to the Binance
+        # tracker when no blend exists yet.
+        current_price = self.blended_price(symbol) or (
+            tracker.latest.price if tracker.latest else None
+        )
 
         # -- Cross-exchange sanity gate: computed FIRST, because it's a pure
         # price comparison that doesn't depend on model readiness. The audit

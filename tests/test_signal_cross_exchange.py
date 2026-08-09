@@ -230,13 +230,51 @@ async def test_inactive_gate_logged_at_debug_not_error(db, caplog):
 # -- source isolation ----------------------------------------------------------
 
 
-def test_coinbase_ticks_never_feed_the_model_tracker():
+def test_coinbase_ticks_never_feed_the_binance_tracker():
     engine = SignalEngine(make_settings(), Database(":memory:"))
     feed_coinbase(engine, 100.0)
 
-    # The model tracker for BTCUSDT must stay empty — Coinbase is gate-only.
+    # The Binance-only model tracker for BTCUSDT must stay empty — Coinbase
+    # never pollutes the momentum/volatility series (single consistent source).
     assert "BTCUSDT" not in engine._trackers
-    assert engine.current_price("BTC") is None
+
+
+def test_blended_price_uses_coinbase_when_binance_absent():
+    engine = SignalEngine(make_settings(), Database(":memory:"))
+    feed_coinbase(engine, 100.0)
+
+    # No Binance ticks yet: the blend falls back to the fresh Coinbase read
+    # so the model isn't blind while the Binance feed is quiet.
+    assert engine.blended_price("BTCUSDT") == pytest.approx(100.0)
+    assert engine.current_price("BTC") == pytest.approx(100.0)
+
+
+def test_blended_price_averages_when_feeds_agree():
+    engine = SignalEngine(make_settings(BINANCE_PRICE_WEIGHT=0.5), Database(":memory:"))
+    feed_binance(engine, [100.0])
+    feed_coinbase(engine, 100.05)  # 0.05% apart — inside the 0.1% tolerance
+
+    assert engine.blended_price("BTCUSDT") == pytest.approx(100.025)
+
+
+def test_blended_price_ignores_coinbase_on_disagreement():
+    engine = SignalEngine(make_settings(BINANCE_PRICE_WEIGHT=0.5), Database(":memory:"))
+    feed_binance(engine, [100.0])
+    feed_coinbase(engine, 105.0)  # 5% apart — far beyond 0.1% tolerance
+
+    # Disagreement: blend must NOT drag the model read toward the
+    # untrustworthy side — Binance alone.
+    assert engine.blended_price("BTCUSDT") == pytest.approx(100.0)
+
+
+def test_blended_price_uses_coinbase_when_binance_stale():
+    engine = SignalEngine(make_settings(), Database(":memory:"))
+    feed_binance(engine, [100.0], )
+    feed_coinbase(engine, 100.2, received_at=time.time())
+    # Make the Binance tick stale (older than CROSS_EXCHANGE_MAX_AGE_S=10).
+    engine._latest_received_at[("binance", "BTCUSDT")] = time.time() - 600
+
+    assert engine.blended_price("BTCUSDT") == pytest.approx(100.2)
 
 
 def test_cross_exchange_disagreement_pct_helper():

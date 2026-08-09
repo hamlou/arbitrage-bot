@@ -80,10 +80,49 @@ class RealizedVolatilityEstimator:
     anyway) divided by average tick spacing, then converts back to price
     units via a linear approximation (valid for the small returns typical
     between consecutive ticks).
+
+    EWMA weighting (decay < 1.0): squared log returns are weighted so the
+    MOST RECENT ticks dominate the estimate — the standard fix for a flat
+    lookback that understates near-term risk during a volatility regime
+    change (news, liquidation cascade).
+
+    WHY EWMA IS OFF BY DEFAULT (verified 2026-08-09, not shipped): the
+    strategy's edge IS a fresh move, and a geometric EWMA over-weights it.
+    Measured on the repo's own scenarios, NO decay + cap combination
+    satisfies both required behaviors:
+      - a single jump after a calm stretch (the fast-path test's 1.5% move)
+        inflated sigma ~4x, collapsing the fair-value edge below threshold;
+      - a SUSTAINED move (9 consecutive ~0.3% returns) had its vol estimate
+        crushed by the contribution cap, inflating the z-score until the
+        model hit the saturation guard instead of the fresh-move gate.
+    The flat average handles both correctly: one jump is treated as a level
+    change (tradeable), sustained moves as volatility (not tradeable).
+    Keep decay=1.0 (flat) unless a live run with order-book data shows the
+    regime lag is actually losing money; the machinery below (decay +
+    max_contribution_fraction) is tested and ready to tune when that data
+    exists.
+
+    SINGLE-TICK CAP: a plain geometric EWMA gives the LAST return up to
+    (1-decay) of the total weight when a jump follows a long calm stretch.
+    max_contribution_fraction caps any ONE return's share of the VARIANCE
+    ESTIMATE ITSELF (0.10 = a lone spike can't count for more than a tenth
+    of the estimate), with the clipped weight spread back over the other
+    returns. Set max_contribution_fraction=1.0 to disable the cap.
     """
 
-    def __init__(self, min_ticks: int = 5):
+    def __init__(
+        self,
+        min_ticks: int = 5,
+        decay: float = 1.0,
+        max_contribution_fraction: float = 1.0,  # disabled by default: decay=1.0 must stay exactly flat
+    ):
         self.min_ticks = min_ticks
+        if not (0.0 < decay <= 1.0):
+            raise ValueError("decay must be in (0, 1]")
+        if not (0.0 < max_contribution_fraction <= 1.0):
+            raise ValueError("max_contribution_fraction must be in (0, 1]")
+        self.decay = decay
+        self.max_contribution_fraction = max_contribution_fraction
 
     def estimate(self, prices: list[float], timestamps: list[float]) -> Optional[float]:
         if len(prices) < self.min_ticks or len(prices) != len(timestamps):
@@ -104,9 +143,44 @@ class RealizedVolatilityEstimator:
             return None
 
         mean_dt = sum(dts) / len(dts)
-        variance = sum(r * r for r in log_returns) / len(log_returns)
         if mean_dt <= 0:
             return None
+
+        # EWMA over returns: weight r_i by decay^(n-1-i) — the LAST (most
+        # recent) return always gets weight 1, older ones decay geometrically.
+        # decay=1.0 collapses to the plain average (previous behavior).
+        n = len(log_returns)
+        weights = [self.decay ** (n - 1 - i) for i in range(n)]
+        total_w = sum(weights)
+
+        # Cap any single return's VARIANCE CONTRIBUTION (w * r^2) so one jump
+        # can't dominate (see class docstring). The excess weight is spread
+        # back over the remaining returns, preserving the EWMA's regime
+        # response in normal conditions. The cap is applied to contributions
+        # computed with the final (capped) weights, so iterate twice:
+        # (1) provisional contributions -> cap on the largest, (2) distribute
+        # the freed weight and re-check (bounded, converges in a few passes
+        # since capping only ever reduces the largest contributions).
+        cap = self.max_contribution_fraction * max(
+            w * r * r for w, r in zip(weights, log_returns)
+        )
+        if cap < max(w * r * r for w, r in zip(weights, log_returns)):
+            for _ in range(8):
+                contributions = [w * r * r for w, r in zip(weights, log_returns)]
+                idx = contributions.index(max(contributions))
+                if contributions[idx] <= cap:
+                    break
+                excess = contributions[idx] - cap
+                weights[idx] = cap / (log_returns[idx] ** 2)
+                # Spread the freed weight over the OTHER returns proportionally.
+                others = [j for j in range(n) if j != idx]
+                other_total = sum(weights[j] for j in others)
+                if other_total <= 0:
+                    break
+                for j in others:
+                    weights[j] += excess * (weights[j] / other_total)
+
+        variance = sum(w * r * r for w, r in zip(weights, log_returns)) / total_w
 
         sigma_log_per_sqrt_s = math.sqrt(variance / mean_dt)
         current_price = prices[-1]
