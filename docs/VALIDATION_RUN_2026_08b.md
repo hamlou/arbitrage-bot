@@ -33,7 +33,7 @@ selectivity or sizing)
 | `FRESH_MOVE_MIN_PCT` | 0.0006 (0.06%) | aligned 15s move required to fire |
 | `FRESH_MOVE_LOOKBACK_S` | 15.0 s | |
 | `MIN_ENTRY_TIME_REMAINING_S` | 45.0 s | no entries in the window's final stretch |
-| `MAX_DIRECTIONAL_ENTRY_PRICE` | 0.80 | never buy a directional token above this |
+| `MAX_DIRECTIONAL_ENTRY_PRICE` | 0.70 | never buy a directional token above this (lowered 0.80->0.70 on 2026-08-09: winners entered avg 0.39 vs losers avg 0.57 — a 0.70 cap blocks 25% of the losers for 1% of the winners) |
 | `TAKER_FEE_PCT` | 0.06 | **the RATE**, not a flat fee — applied as `rate · p · (1−p)` per share (see §2) |
 | `FAST_PATH_MOVE_TRIGGER_PCT` | 0.0010 (0.10%) | fast-path trigger |
 | `FAST_PATH_COOLDOWN_S` | 0.5 s | |

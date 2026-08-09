@@ -84,7 +84,11 @@ class Settings(BaseSettings):
     # assumption. Verified 2026-08-06: the bot opened YES @ 0.82 and NO @ 0.99
     # (the latter can mathematically never profit after fees) and lost ~$170
     # on two of those entries. 0.80 is deliberately conservative.
-    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.80
+    # Lowered 0.80 -> 0.70 on 2026-08-09: measured on 79 distinct blocked
+    # markets, winners entered at avg 0.39 while the 12 losers entered at avg
+    # 0.57 — the expensive entries are where the losses concentrate. A 0.70
+    # cap blocks 25% of the losers for the cost of only 1% of the winners.
+    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.70
     # Polymarket's crypto taker fee RATE — NOT a flat fraction. The per-share
     # fee is fee_rate * p * (1 - p); as a fraction of what you spend that is
     # fee_rate * (1 - p) per side (~3% of notional at p=0.50, ~1.2% at
