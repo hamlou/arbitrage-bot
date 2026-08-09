@@ -1023,11 +1023,10 @@ class TradingApp:
             # fast path fills against) so a round-trip exit is as fast as the
             # entry that triggered it; fall back to REST when the cache isn't
             # fresh. The round-trip protocol only works if the exit doesn't
-            # eat the window the entry just won. Note the source split: this
-            # DECISION reads the cache, but the actual SELL
-            # (close_position_early) walks the REST book — in paper mode both
-            # are the same live market and REST is authoritative for the
-            # fill; the cache only decides WHEN to attempt the exit.
+            # eat the window the entry just won. The DECISION and the SELL
+            # (close_position_early) share the same get_order_book source and
+            # the same bid-side walk (broker.quote_exit), so an exit can
+            # never fire on a price the fill cannot reach.
             book = None
             try:
                 if self.ws_feed.is_fresh(token_id):
@@ -1047,10 +1046,22 @@ class TradingApp:
                     continue
                 except Exception:
                     continue
-            if book.mid is None:
+            # The exit DECISION must use the same walked bid-side price the
+            # SELL will fill at (broker.quote_exit == the fill computation).
+            # Using book.mid here was the phantom-gain bug: on the wide books
+            # of 5-min crypto markets, mid (bid+ask)/2 can sit >= REPRICE
+            # gain above entry while the bid side still rests at the entry
+            # price — the exit "fired", the fill walked bids at entry, and
+            # the trade booked a guaranteed loss after fees. Also refuse to
+            # consider an exit the book cannot fully absorb (thin bid side).
+            entry_price = t["entry_price"]
+            shares = t["size_usd"] / entry_price if entry_price else 0.0
+            if shares <= 0:
                 continue
-
-            unrealized_pct = (book.mid - t["entry_price"]) / t["entry_price"]
+            exit_price, filled_shares = self.broker.quote_exit(book, shares)
+            if filled_shares < shares - 1e-9:
+                continue  # thin book — no honest exit exists at this price
+            unrealized_pct = (exit_price - entry_price) / entry_price
 
             # Round-trip protocol (the missing piece — see the AdiiX article
             # and REPRICE_EXIT_* settings): while the position is still inside

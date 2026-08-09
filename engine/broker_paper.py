@@ -508,12 +508,30 @@ class PaperBroker:
         )
         return 0
 
+    def quote_exit(self, book: OrderBook, shares: float) -> tuple[float, float]:
+        """
+        Quote what an early-exit SELL would actually get: the walked bid-side
+        average (price, shares_filled). THE DECISION AND THE FILL SHARE THIS
+        EXACT COMPUTATION so an exit can never fire on a price the fill
+        cannot reach. (The old decision used book.mid — halfway between bid
+        and ask — while the fill walked the bid side; on the wide books of
+        5-min crypto markets mid can show a +REPRICE gain the bid side
+        cannot deliver, producing exits that "fire" and fill at the entry
+        price: a guaranteed loss after fees.)
+        """
+        return self._walk_book_for_sale(book, shares)
+
     async def close_position_early(self, market: Market, trade_id: int, reason: str) -> Optional[float]:
         """
         Exits a specific open position before settlement, selling the held
         shares against the current live book. Without this, positions could
         only ever be held to expiry — no take-profit, no cutting a position
         whose edge has reversed.
+
+        FOK semantics: the exit is REFUSED unless the bid side can absorb the
+        ENTIRE position at the walked price. The old code closed the trade
+        even on a partial fill — booking a loss equal to the unfilled
+        remainder and deleting the position's unrealized value.
         """
         open_trades = await self.db.get_open_trades(mode=self.mode)
         trade = next((t for t in open_trades if t["id"] == trade_id), None)
@@ -527,6 +545,13 @@ class PaperBroker:
         exit_price, filled_shares = self._walk_book_for_sale(book, shares)
         if filled_shares <= 0:
             logger.warning("Could not exit trade %d for %s — no bid depth", trade_id, market.market_id)
+            return None
+        if filled_shares < shares - 1e-9:
+            logger.warning(
+                "Refusing exit of trade %d for %s: bid side absorbs only %.1f of %.1f shares "
+                "(thin book) — holding position rather than closing at a phantom price",
+                trade_id, market.market_id, filled_shares, shares,
+            )
             return None
 
         proceeds = filled_shares * exit_price

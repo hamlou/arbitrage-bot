@@ -360,6 +360,30 @@ async def test_close_position_early_realizes_pnl_before_settlement(db):
     assert not broker.has_open_position("m1")
 
 
+async def test_close_position_early_refuses_partial_fill_on_thin_book(db):
+    """
+    FOK semantics: if the bid side cannot absorb the ENTIRE position, the
+    exit must be refused rather than closing the trade at a phantom partial
+    price. The old code booked a loss equal to the unfilled remainder and
+    deleted the position's unrealized value.
+    """
+    books = {"tok_yes": make_symmetric_book("tok_yes"), "tok_no": make_symmetric_book("tok_no")}
+    feed = FakeFeed(books)
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0)
+    fill = await broker.place_order(make_market(), "YES", 100)  # ~178.6 shares @ 0.56
+
+    # Shrink the bid side so it can only absorb ~80 of ~178.6 shares.
+    books["tok_yes"] = OrderBook(
+        market_id="m1", token_id="tok_yes",
+        bids=(OrderBookLevel(price=0.60, size=80),),
+        asks=(OrderBookLevel(price=0.62, size=1000),),
+    )
+
+    pnl = await broker.close_position_early(make_market(), fill.trade_id, reason="TAKE_PROFIT")
+    assert pnl is None  # refused — cannot sell the whole position
+    assert broker.has_open_position("m1")  # position survives, not deleted
+
+
 async def test_close_position_early_can_show_a_loss_from_spread_alone(db):
     """With no book movement at all, exiting immediately after entry realizes
     a loss purely from crossing the bid-ask spread -- this is expected and

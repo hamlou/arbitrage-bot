@@ -479,6 +479,42 @@ async def test_reprice_exit_banks_convergence(app_settings):
         await app.db.close()
 
 
+async def test_reprice_exit_does_not_fire_on_phantom_mid_gain(app_settings):
+    """
+    Regression for the phantom-gain bug: the exit DECISION used book.mid
+    (halfway between bid and ask) while the SELL walked the bid side. On the
+    wide books of 5-min crypto markets, mid can show a >= REPRICE_EXIT_GAIN_PCT
+    gain above entry while the bid side still rests at the entry price — the
+    exit then "fires" and fills at the entry price, a guaranteed loss after
+    fees. The decision must use the walked bid price, so a wide book with
+    bid == entry must NOT trigger REPRICE even when mid looks like +10%.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)  # entry @ 0.51 (ask)
+        assert fill.avg_price == pytest.approx(0.51, abs=0.005)
+
+        # Wide book: bid == entry (0.51), ask 0.61 → mid 0.56 ≈ +10% from
+        # 0.51. The old mid-based decision fired REPRICE here and filled at
+        # 0.51 (a guaranteed loss). The walked bid side gives 0.51 → 0% gain.
+        wide = make_book(market.token_id_yes, 0.51, 0.61)
+        app.feed.books[market.token_id_yes] = wide
+
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 1  # no phantom exit — position still held
+    finally:
+        await app.db.close()
+
+
 async def test_reprice_exit_ignored_after_max_hold(app_settings):
     """
     Once REPRICE_EXIT_MAX_HOLD_S has elapsed, the arbitrage window is gone —
