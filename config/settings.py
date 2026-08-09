@@ -139,6 +139,19 @@ class Settings(BaseSettings):
     #     book noise dominates.
     FRESH_MOVE_LOOKBACK_S: float = 15.0
     FRESH_MOVE_MIN_PCT: float = 0.0006   # 0.06% in 15s, aligned with the model
+    # Large-edge bypass of the fresh-move magnitude floor (verified 2026-08-09
+    # on 41k logged evaluations): the fresh-move gate exists to reject STALE
+    # DRIFT passed off as a fresh lag (-$35 loss). But measuring shows it also
+    # blocks the strategy's best trades: 4,033 fair-value signals with edge
+    # > 5pt were blocked, and 90% of those markets converged toward the model's
+    # read (95% simulated win rate at realistic costs; median reprice < 60s).
+    # When the model-vs-market edge is THIS large (>= this threshold), the
+    # divergence itself is the signal — the market is lagging something real,
+    # even if the last 15s happened to be flat. The bypass still REQUIRES the
+    # recent move to agree in DIRECTION (no fresh move in the model's
+    # direction = nothing to lag = still blocked); it only drops the magnitude
+    # floor. Small edges keep the strict gate.
+    FRESH_MOVE_LARGE_EDGE_BYPASS_PCT: float = 0.12
     MIN_ENTRY_TIME_REMAINING_S: float = 45.0
     # Reference-price trust guard for the fair-value model (verified
     # 2026-08-07): the reference price is captured at FIRST SIGHTING of a

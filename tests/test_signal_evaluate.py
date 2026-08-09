@@ -286,6 +286,59 @@ async def test_blocks_when_momentum_opposes_model_direction(db):
     assert "no fresh aligned move" in signal.reason
 
 
+async def test_large_edge_bypasses_fresh_move_magnitude_floor(db):
+    """Verified 2026-08-09 on 41k logged signals: the fresh-move gate blocked
+    4,033 fair-value signals with edge > 5pt, and 90% of those markets later
+    converged toward the model's read (95% simulated win rate). When the edge
+    is >= FRESH_MOVE_LARGE_EDGE_BYPASS_PCT, a tiny-but-aligned move must pass
+    the gate — the divergence itself is the signal."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+        FRESH_MOVE_LARGE_EDGE_BYPASS_PCT=0.12,
+    )
+    engine = SignalEngine(settings, db)
+
+    # Big downward move (64000 -> 62000, ~3%), market priced at 0.55 — the
+    # model leans NO hard (implied NO ~0.90+, edge >> 0.12). Then a tiny
+    # continued drift DOWN (62000 -> 61980) so the 15s move is aligned in
+    # direction but below FRESH_MOVE_MIN_PCT in magnitude.
+    feed_ticks(engine, [64000, 63000, 62000, 61990, 61980])
+    market = make_market(reference_price=64000, expires_at_ts=time.time() + 300)
+    yes_book = make_book("tok_yes", 0.54, 0.56)
+    no_book = make_book("tok_no", 0.44, 0.46)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.side == "NO"  # model still leans NO
+    assert signal.fired is True  # large edge bypasses the magnitude floor
+
+
+async def test_large_edge_still_blocks_when_direction_opposes(db):
+    """The bypass drops the MAGNITUDE floor only — the recent move must still
+    agree in DIRECTION with the model. A huge edge with the market moving the
+    OTHER way is a drift/repricing against the model, exactly what the gate
+    exists to stop."""
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+        FRESH_MOVE_LARGE_EDGE_BYPASS_PCT=0.12,
+    )
+    engine = SignalEngine(settings, db)
+
+    # Price far BELOW reference (fair-value model says NO hard) while price is
+    # RISING back toward it — opposite direction to the model's lean. Enough
+    # ticks for the volatility estimator so fair-value engages (not fallback).
+    feed_ticks(engine, [60000, 60050, 60100, 60200, 60400, 60800, 61400, 62200, 63200, 64400, 64500])
+    market = make_market(reference_price=70000, expires_at_ts=time.time() + 300)
+    yes_book = make_book("tok_yes", 0.50, 0.52)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.side == "NO"  # model says NO (price below reference)
+    assert signal.fired is False  # but price is RISING against the model
+    assert "no fresh aligned move" in signal.reason
+
+
 async def test_blocks_entry_when_window_almost_over(db):
     """Even with a genuine aligned move, entering in the final seconds of a
     window is a noise trade — the market has effectively decided. Must not

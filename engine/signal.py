@@ -479,9 +479,22 @@ class SignalEngine:
         prices, _ = tracker.prices_and_timestamps(self.settings.FRESH_MOVE_LOOKBACK_S)
         if len(prices) >= 2 and prices[0] > 0:
             move = (prices[-1] - prices[0]) / prices[0]
+            # Large-edge bypass (verified 2026-08-09 on 41k logged signals):
+            # when the model-vs-market edge is huge, the divergence itself is
+            # the signal — the market is lagging something real even if the
+            # last 15s happened to be flat. The bypass drops the MAGNITUDE
+            # floor only; the move must still agree in DIRECTION with the
+            # model (no fresh move in the model's direction = nothing to lag
+            # = still blocked). Small edges keep the strict gate.
+            large_edge = edge_pct >= self.settings.FRESH_MOVE_LARGE_EDGE_BYPASS_PCT
+            direction_ok_move = (
+                (implied_prob > polymarket_prob and move > 0)
+                or (implied_prob < polymarket_prob and move < 0)
+            )
             aligned = (
                 (implied_prob > polymarket_prob and move > self.settings.FRESH_MOVE_MIN_PCT)
                 or (implied_prob < polymarket_prob and move < -self.settings.FRESH_MOVE_MIN_PCT)
+                or (large_edge and direction_ok_move)
             )
             if not aligned:
                 fresh_move_ok = False
