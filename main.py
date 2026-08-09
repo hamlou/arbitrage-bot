@@ -240,6 +240,9 @@ class TradingApp:
             f"Bot starting up in {mode_label} mode. Restored {restored} open position(s).",
             level=AlertLevel.INFO,
         )
+        # Push the button menu on boot so the user immediately sees the bot is
+        # alive and how to use it (no slash-command knowledge required).
+        await self.telegram_reporter.send_welcome()
 
     async def _binance_ingest_loop(self) -> None:
         async for update in self.binance_feed.stream():

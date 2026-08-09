@@ -270,18 +270,68 @@ async def test_run_command_listener_registers_all_commands():
         app.stop_on_poll = stop  # stop once polling starts
         await r.run_command_listener(stop)
 
-    commands = {cmd for h in app.handlers for cmd in h.commands}
-    assert commands == {
-        "status", "stats", "crm", "positions", "trades", "risk", "feeds",
-        "config", "latency", "pause", "resume", "mute", "unmute", "alerts",
-        "help",
+    commands = {
+        cmd for h in app.handlers if getattr(h, "commands", None) for cmd in h.commands
     }
+    assert commands == {
+        "start", "menu", "status", "stats", "crm", "positions", "trades",
+        "risk", "feeds", "config", "latency", "pause", "resume", "mute",
+        "unmute", "alerts", "help",
+    }
+    # The button interface is registered alongside the slash commands.
+    from telegram.ext import CallbackQueryHandler, MessageHandler
+
+    assert any(isinstance(h, CallbackQueryHandler) for h in app.handlers)
+    assert any(isinstance(h, MessageHandler) for h in app.handlers)
 
 
 @pytest.mark.asyncio
 async def test_run_command_listener_skips_when_disabled():
     r = TelegramReporter(None, None)
     await r.run_command_listener(asyncio.Event())  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_menu_markup_has_all_buttons():
+    """The inline menu must expose every action as a tappable button."""
+    r = TelegramReporter(TOKEN, CHAT_ID)
+    markup = r._menu_markup()
+    data = {btn.callback_data for row in markup.inline_keyboard for btn in row}
+    assert data == {
+        "btn_status", "btn_positions", "btn_trades", "btn_risk", "btn_feeds",
+        "btn_latency", "btn_pause", "btn_resume", "btn_mute", "btn_unmute",
+        "btn_help",
+    }
+
+
+@pytest.mark.asyncio
+async def test_on_callback_dispatches_and_acknowledges():
+    """A button press must be acknowledged and routed to the matching builder."""
+    r = TelegramReporter(TOKEN, CHAT_ID, status_provider=lambda: SNAPSHOT)
+
+    class FakeQuery:
+        data = "btn_status"
+        answered = False
+
+        async def answer(self) -> None:
+            self.answered = True
+
+    class FakeChat:
+        id = int(CHAT_ID)
+        sent: list[tuple] = []
+
+        async def send_message(self, **kwargs) -> None:
+            self.sent.append(kwargs)
+
+    class FakeUpdate:
+        def __init__(self):
+            self.callback_query = FakeQuery()
+            self.effective_chat = FakeChat()
+
+    update = FakeUpdate()
+    await r._on_callback(update, None)
+    assert update.callback_query.answered is True
+    assert len(update.effective_chat.sent) == 1  # a status reply was sent
 
 
 @pytest.mark.asyncio

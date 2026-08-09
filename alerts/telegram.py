@@ -216,12 +216,120 @@ class TelegramReporter:
         return self.chat_id is not None and chat is not None and str(chat.id) == self.chat_id
 
     async def _send_reply(self, update, text: str, html: bool = False) -> None:
-        """Send a reply to the command's chat; swallows all failures."""
+        """Send a reply to the command's chat; swallows all failures. The
+        button menu is attached to every reply so the bot feels like an app."""
         try:
             kwargs = self._answer(text, html=html)
+            if self._authorized(update):
+                kwargs["reply_markup"] = self._menu_markup()
             await update.effective_chat.send_message(**kwargs)
         except Exception:
             logger.exception("Failed to answer Telegram command")
+
+    def _menu_markup(self):
+        """Inline keyboard attached to replies: one tap per action, no slash
+        commands. Every button dispatches to the same content builders as the
+        /commands, so the two interfaces never drift."""
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📊 Status", callback_data="btn_status"),
+                    InlineKeyboardButton("📈 Positions", callback_data="btn_positions"),
+                ],
+                [
+                    InlineKeyboardButton("💰 Trades", callback_data="btn_trades"),
+                    InlineKeyboardButton("⚠️ Risk", callback_data="btn_risk"),
+                ],
+                [
+                    InlineKeyboardButton("📡 Feeds", callback_data="btn_feeds"),
+                    InlineKeyboardButton("⏱ Latency", callback_data="btn_latency"),
+                ],
+                [
+                    InlineKeyboardButton("⏸ Pause", callback_data="btn_pause"),
+                    InlineKeyboardButton("▶️ Resume", callback_data="btn_resume"),
+                ],
+                [
+                    InlineKeyboardButton("🔇 Mute", callback_data="btn_mute"),
+                    InlineKeyboardButton("🔊 Unmute", callback_data="btn_unmute"),
+                ],
+                [InlineKeyboardButton("🆘 Help", callback_data="btn_help")],
+            ]
+        )
+
+    async def _cmd_menu(self, update, context) -> None:
+        """/start and /menu — and any plain text message: show the menu."""
+        if not self._authorized(update):
+            return
+        try:
+            text = (
+                "<b>🤖 Arb Bot</b>\n"
+                "Watching the market gaps 24/7 in paper mode.\n"
+                "Tap a button — everything is live."
+            )
+            await update.effective_chat.send_message(
+                text=text, parse_mode="HTML", reply_markup=self._menu_markup()
+            )
+        except Exception:
+            logger.exception("Failed to show menu")
+
+    async def _on_callback(self, update, context) -> None:
+        """Button presses. Dispatch to the same builders as the slash commands
+        (so content never drifts), then acknowledge the tap."""
+        query = update.callback_query
+        if query is None or not self._authorized(update):
+            return
+        try:
+            await query.answer()  # acknowledge first, always
+        except Exception:
+            logger.debug("Could not acknowledge callback", exc_info=True)
+        action = query.data or ""
+        handlers = {
+            "btn_status": self._cmd_status,
+            "btn_positions": self._cmd_positions,
+            "btn_trades": self._cmd_trades,
+            "btn_risk": self._cmd_risk,
+            "btn_feeds": self._cmd_feeds,
+            "btn_latency": self._cmd_latency,
+            "btn_pause": self._cmd_pause,
+            "btn_resume": self._cmd_resume,
+            "btn_mute": self._cmd_mute,
+            "btn_unmute": self._cmd_unmute,
+            "btn_help": self._cmd_help,
+        }
+        handler = handlers.get(action)
+        if handler is None:
+            return
+        try:
+            await handler(update, context)
+        except Exception:
+            logger.exception("Button handler %s failed", action)
+
+    async def send_welcome(self) -> bool:
+        """Push the button menu on startup so the user immediately sees the
+        bot is alive and how to use it. Never raises."""
+        if not self.enabled:
+            return False
+        try:
+            from telegram import Bot
+
+            bot = Bot(token=self.bot_token)
+            await bot.send_message(
+                chat_id=self.chat_id,
+                text=(
+                    "✅ <b>Arb bot is online</b> (paper mode)\n"
+                    "I'm watching the market gaps 24/7. Tap a button — "
+                    "everything is live."
+                ),
+                parse_mode="HTML",
+                reply_markup=self._menu_markup(),
+            )
+            logger.info("Welcome + button menu sent to Telegram")
+            return True
+        except Exception:
+            logger.exception("Failed to send welcome message")
+            return False
 
     async def _get_snapshot(self) -> dict:
         if self.status_provider is None:
@@ -484,7 +592,13 @@ class TelegramReporter:
         import asyncio
 
         try:
-            from telegram.ext import Application, CommandHandler
+            from telegram.ext import (
+                Application,
+                CallbackQueryHandler,
+                CommandHandler,
+                MessageHandler,
+                filters,
+            )
         except Exception:
             logger.exception("python-telegram-bot Application unavailable; commands disabled")
             return
@@ -492,6 +606,8 @@ class TelegramReporter:
         application = Application.builder().token(self.bot_token).build()
         self._application = application
         for name, handler in [
+            ("start", self._cmd_menu),
+            ("menu", self._cmd_menu),
             ("status", self._cmd_status),
             ("stats", self._cmd_stats),
             ("crm", self._cmd_crm),
@@ -509,15 +625,25 @@ class TelegramReporter:
             ("help", self._cmd_help),
         ]:
             application.add_handler(CommandHandler(name, handler))
+        # Buttons: inline-keyboard menu + any plain text shows the menu too.
+        application.add_handler(CallbackQueryHandler(self._on_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._cmd_menu))
 
         # run_polling() initializes/starts/stops/shuts down the Application
         # itself and RE-RAISES fatal polling errors (like Conflict) after its
         # own cleanup — exactly what the retry loop needs to see. stop_signals
         # is None so PTB never installs its own SIGINT/SIGTERM handlers in the
-        # bot's loop (main.py owns shutdown).
+        # bot's loop (main.py owns shutdown). close_loop=False is REQUIRED:
+        # we run inside the bot's own event loop, and close_loop=True would
+        # close that loop when the session ends (fixed 2026-08-09).
+        logger.info("Telegram command listener: starting polling session")
         stop_waiter = asyncio.create_task(stop_event.wait())
         poll_task = asyncio.create_task(
-            application.run_polling(drop_pending_updates=True, stop_signals=None)
+            application.run_polling(
+                drop_pending_updates=True,
+                stop_signals=None,
+                close_loop=False,
+            )
         )
         try:
             done, _ = await asyncio.wait(
