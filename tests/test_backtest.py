@@ -85,6 +85,40 @@ def test_accepts_binance_klines_format(tmp_path, monkeypatch, capsys):
     assert "400 points" in _line_with(out, "Price data")
 
 
+def test_klines_loader_handles_microsecond_timestamps(tmp_path):
+    """data.binance.vision 1s klines ship open_time in MICROSECONDS (~1.78e15
+    for 2026). The loader must convert to seconds, not treat them as
+    milliseconds — that bug produced a "4000-day span" and coin-flip model
+    output on real July-2026 data (found 2026-08-09)."""
+    from scripts.calibrate_momentum_model import load_binance_klines_csv
+
+    klines = tmp_path / "klines_1s.csv"
+    with klines.open("w") as f:
+        for i in range(5):
+            us = 1_782_864_000_000_000 + i * 1_000_000  # 2026-07-01 00:00:00Z, 1s apart
+            f.write(f"{us},65000,65010,64990,65005,10,{i},1000,5,5,500,0\n")
+
+    timestamps, prices = load_binance_klines_csv(klines)
+    assert timestamps[0] == 1_782_864_000.0  # seconds, not ms
+    assert timestamps[1] - timestamps[0] == 1.0
+    assert prices[0] == 65005.0
+
+
+def test_klines_loader_still_accepts_millisecond_timestamps(tmp_path):
+    """The klines API and most archives use milliseconds — must keep working."""
+    from scripts.calibrate_momentum_model import load_binance_klines_csv
+
+    klines = tmp_path / "klines_ms.csv"
+    with klines.open("w") as f:
+        for i in range(3):
+            ms = (1_782_864_000 + i) * 1000
+            f.write(f"{ms},65000,65010,64990,65005,10,{i},1000,5,5,500,0\n")
+
+    timestamps, _ = load_binance_klines_csv(klines)
+    assert timestamps[0] == 1_782_864_000.0
+    assert timestamps[1] - timestamps[0] == 1.0
+
+
 def test_calls_real_fair_value_function(tmp_path, monkeypatch, capsys):
     """Proves the script drives the REAL engine/fair_value function rather
     than a reimplementation (the spy wraps the imported real function)."""

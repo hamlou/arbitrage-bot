@@ -61,9 +61,22 @@ def load_binance_klines_csv(path: Path) -> tuple[list[float], list[float]]:
         for row in reader:
             if not row or not row[0].replace(".", "", 1).isdigit():
                 continue  # skip any header/blank lines defensively
-            open_time_ms = float(row[0])
+            open_time_raw = float(row[0])
             close_price = float(row[4])
-            timestamps.append(open_time_ms / 1000.0)
+            # open_time unit varies by source. data.binance.vision 1s klines
+            # ship it in MICROSECONDS (~1.78e15 for 2026); the klines API and
+            # most archives use milliseconds (~1.78e12); price CSVs use
+            # seconds (~1.78e9). Detect by magnitude so all three work —
+            # found 2026-08-09: 1s files parsed as ms produced a "4000-day
+            # span" and coin-flip model output because every window boundary
+            # was misaligned.
+            if open_time_raw > 1e14:
+                open_time_s = open_time_raw / 1e6
+            elif open_time_raw > 1e11:
+                open_time_s = open_time_raw / 1e3
+            else:
+                open_time_s = open_time_raw
+            timestamps.append(open_time_s)
             prices.append(close_price)
     return timestamps, prices
 
