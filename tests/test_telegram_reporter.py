@@ -231,9 +231,18 @@ class FakeApplication:
     def __init__(self):
         self.handlers: list = []
         self.updater = FakeUpdater()
+        self.stop_on_poll: asyncio.Event | None = None
 
     def add_handler(self, h) -> None:
         self.handlers.append(h)
+
+    async def run_polling(self, **kwargs) -> None:
+        # Set the stop event once polling actually starts (so the listener's
+        # retry loop has a session to run), then block until cancelled —
+        # mirrors the real (blocking) run_polling.
+        if self.stop_on_poll is not None:
+            self.stop_on_poll.set()
+        await asyncio.Event().wait()
 
     async def initialize(self) -> None:
         pass
@@ -258,7 +267,7 @@ async def test_run_command_listener_registers_all_commands():
         mock_cls.builder.return_value = builder  # Application.builder() -> builder
         r = TelegramReporter(TOKEN, CHAT_ID, status_provider=lambda: SNAPSHOT)
         stop = asyncio.Event()
-        stop.set()  # return immediately after starting
+        app.stop_on_poll = stop  # stop once polling starts
         await r.run_command_listener(stop)
 
     commands = {cmd for h in app.handlers for cmd in h.commands}
@@ -273,6 +282,28 @@ async def test_run_command_listener_registers_all_commands():
 async def test_run_command_listener_skips_when_disabled():
     r = TelegramReporter(None, None)
     await r.run_command_listener(asyncio.Event())  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_run_command_listener_survives_telegram_conflict():
+    """A Telegram Conflict (another instance polling the same token) must be
+    logged and retried — never propagated, never fatal (this is the failure
+    that crashed the cloud instance on 2026-08-09)."""
+    r = TelegramReporter(TOKEN, CHAT_ID)
+    r.retry_s = 0.01
+
+    calls = {"n": 0}
+
+    async def fake_session(stop):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception("Conflict: terminated by other getUpdates request")
+        stop.set()  # second attempt succeeds; stop so the loop exits
+
+    r._run_polling_session = fake_session
+    stop = asyncio.Event()
+    await r.run_command_listener(stop)  # must return without raising
+    assert calls["n"] == 2
 
 
 # ---------------------------------------------------------------------------
