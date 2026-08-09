@@ -20,6 +20,7 @@ from typing import Optional, Union
 
 from alerts.telegram import AlertLevel, build_alerter, build_reporter
 from config.settings import settings
+from engine import cloud_backup
 from data.binance_feed import BinanceFeed, PriceUpdate
 from data.coinbase_feed import CoinbaseFeed
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed, TokenNotFoundError
@@ -1556,7 +1557,11 @@ class TradingApp:
             asyncio.create_task(self._market_discovery_loop(), name="market_discovery"),
             asyncio.create_task(self._settlement_loop(), name="settlement"),
             asyncio.create_task(self._trading_loop(), name="trading_loop"),
-            asyncio.create_task(run_dashboard(self._get_dashboard_state), name="dashboard"),
+            *(
+                [asyncio.create_task(run_dashboard(self._get_dashboard_state), name="dashboard")]
+                if (sys.stdout.isatty() or os.environ.get("FORCE_DASHBOARD") == "1")
+                else []
+            ),
             asyncio.create_task(self._command_center_state_loop(), name="command_center_state"),
             asyncio.create_task(self._lag_tracker_loop(), name="lag_tracker"),
         ]
@@ -1564,6 +1569,8 @@ class TradingApp:
             tasks.append(asyncio.create_task(self._telegram_status_loop(), name="telegram_status"))
             if settings.TELEGRAM_COMMANDS_ENABLED:
                 tasks.append(asyncio.create_task(self._telegram_command_loop(), name="telegram_commands"))
+        if cloud_backup.backup_enabled(settings):
+            tasks.append(asyncio.create_task(self._cloud_backup_loop(), name="cloud_backup"))
 
         await self._shutdown.wait()
         logger.info("Shutdown signal received, cancelling tasks...")
@@ -1573,6 +1580,29 @@ class TradingApp:
         await self.feed.aclose()
         await self.db.close()
         logger.info("Shutdown complete.")
+
+
+    async def _cloud_backup_loop(self) -> None:
+        """Send a consistent ledger snapshot to Telegram on an interval.
+
+        This is the persistence layer for ephemeral hosts (Render free wipes
+        the local disk on every restart). Inert unless CLOUD_BACKUP_ENABLED.
+        """
+        interval_s = settings.CLOUD_BACKUP_INTERVAL_MIN * 60.0
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+                sent = await cloud_backup.send_db_backup(
+                    Path(settings.DATABASE_PATH),
+                    settings.TELEGRAM_BOT_TOKEN,
+                    settings.TELEGRAM_CHAT_ID,
+                )
+                if sent:
+                    logger.info("Cloud backup sent (file_id=%s...)", sent[:8])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cloud backup failed; will retry next interval")
 
 
 async def main() -> None:
@@ -1586,6 +1616,17 @@ async def main() -> None:
             "Kill the existing process and retry."
         )
         sys.exit(1)
+    # Ephemeral-host persistence: Render free wipes the disk on restart, so if
+    # the ledger is missing here we may be able to restore it from the last
+    # Telegram backup (see engine/cloud_backup.py). Inert unless enabled.
+    if cloud_backup.backup_enabled(settings):
+        outcome = await cloud_backup.restore_if_needed(
+            Path(settings.DATABASE_PATH),
+            settings.TELEGRAM_BOT_TOKEN,
+            settings.TELEGRAM_CHAT_ID,
+            timeout_s=settings.CLOUD_RESTORE_TIMEOUT_S,
+        )
+        logger.info("Cloud backup restore outcome: %s", outcome)
     app = TradingApp()
     try:
         await app.run()

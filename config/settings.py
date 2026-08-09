@@ -235,6 +235,16 @@ class Settings(BaseSettings):
     # never silence a safety message. Toggle at runtime with /mute and /unmute.
     TELEGRAM_MUTED_DEFAULT: bool = False
 
+    # --- Cloud persistence (ephemeral hosts: Render free wipes local disk) -----
+    # When enabled, a consistent snapshot of the SQLite ledger is sent to
+    # TELEGRAM_CHAT_ID every CLOUD_BACKUP_INTERVAL_MIN minutes, and on boot
+    # with a missing DB the bot asks the user to forward the latest backup to
+    # restore it. Fully inert (no network calls) when disabled, so local runs
+    # are completely unaffected.
+    CLOUD_BACKUP_ENABLED: bool = False
+    CLOUD_BACKUP_INTERVAL_MIN: float = 15.0
+    CLOUD_RESTORE_TIMEOUT_S: float = 120.0
+
     # --- Event-driven fast path (win-the-gap) --------------------------------
     # The 1s polling cycle can miss a ~2s arbitrage window: a Binance move that
     # lands just after a cycle is only seen up to a second later, then two REST

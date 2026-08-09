@@ -1,0 +1,47 @@
+# Render blueprint for the arbitrage bot (free tier, no credit card).
+#
+# Deploy: push this repo to GitHub, then in the Render dashboard choose
+# "New -> Blueprint" and paste the repo URL. Render reads this file and
+# creates the web service with the env vars below.
+#
+# Free-tier reality (verified against docs.render.com/docs/free, Aug 2026):
+#   * Spins down after 15 min WITHOUT inbound traffic -> keep it alive with a
+#     free ping (cron-job.org or UptimeRobot) hitting /api/health every 5 min.
+#   * 750 free instance-hours/month; one always-awake service uses ~720.
+#   * Local disk is WIPED on every restart/redeploy -> the bot auto-backs its
+#     SQLite ledger up to Telegram (CLOUD_BACKUP_ENABLED=true) and restores it
+#     on boot when the disk is empty.
+#   * May be restarted at any time; "service-initiated traffic" suspension is
+#     possible if outbound volume is uncommonly high (the bot's WS streams are
+#     modest, but keep an eye on the dashboard if deployments stop working).
+services:
+  - type: web
+    name: arb-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cloud_entry.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PAPER_MODE
+        value: "true"
+      # Cloud persistence: snapshot the ledger to Telegram every 15 min and
+      # restore it on boot after a disk wipe. Requires the two Telegram vars.
+      - key: CLOUD_BACKUP_ENABLED
+        value: "true"
+      - key: CLOUD_BACKUP_INTERVAL_MIN
+        value: "15"
+      - key: CLOUD_RESTORE_TIMEOUT_S
+        value: "120"
+      # A fresh (never-backed-up) ledger starts at this documented balance.
+      - key: STARTING_PAPER_BALANCE_USD
+        value: "1000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # --- set these in the Render dashboard (never commit them) ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DATABASE_PATH
+        value: storage/arb_bot.db
