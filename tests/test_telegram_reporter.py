@@ -236,19 +236,14 @@ class FakeApplication:
     def add_handler(self, h) -> None:
         self.handlers.append(h)
 
-    async def run_polling(self, **kwargs) -> None:
-        # Set the stop event once polling actually starts (so the listener's
-        # retry loop has a session to run), then block until cancelled —
-        # mirrors the real (blocking) run_polling.
-        if self.stop_on_poll is not None:
-            self.stop_on_poll.set()
-        await asyncio.Event().wait()
-
     async def initialize(self) -> None:
         pass
 
     async def start(self) -> None:
-        pass
+        # Signal that the session reached the running phase, so the listener's
+        # retry loop has a session to run and the stop_event fires.
+        if self.stop_on_poll is not None:
+            self.stop_on_poll.set()
 
     async def stop(self) -> None:
         pass

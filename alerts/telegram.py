@@ -585,10 +585,17 @@ class TelegramReporter:
                 continue
 
     async def _run_polling_session(self, stop_event) -> None:
-        """One polling session. Builds a FRESH Application each time (a
-        poisoned instance is never reused), polls until stop_event is set, and
-        returns cleanly. Fatal polling errors (e.g. ``Conflict``) propagate to
-        the caller, which retries with backoff."""
+        """One polling session, using the canonical in-loop pattern:
+        ``application.initialize()`` / ``application.start()`` then
+        ``updater.start_polling()`` (non-blocking) then wait on stop_event.
+
+        ``Application.run_polling()`` CANNOT be used here — it calls
+        ``loop.run_until_complete()`` internally, which raises "This event
+        loop is already running" inside our own loop (seen live on Render,
+        2026-08-09, PTB 22.8). Polling errors (including Conflict) are
+        retried forever by PTB's own network retry loop, so no watchdog is
+        needed: a Conflict self-heals once the other instance stops.
+        """
         import asyncio
 
         try:
@@ -629,34 +636,25 @@ class TelegramReporter:
         application.add_handler(CallbackQueryHandler(self._on_callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._cmd_menu))
 
-        # run_polling() initializes/starts/stops/shuts down the Application
-        # itself and RE-RAISES fatal polling errors (like Conflict) after its
-        # own cleanup — exactly what the retry loop needs to see. stop_signals
-        # is None so PTB never installs its own SIGINT/SIGTERM handlers in the
-        # bot's loop (main.py owns shutdown). close_loop=False is REQUIRED:
-        # we run inside the bot's own event loop, and close_loop=True would
-        # close that loop when the session ends (fixed 2026-08-09).
-        logger.info("Telegram command listener: starting polling session")
-        stop_waiter = asyncio.create_task(stop_event.wait())
-        poll_task = asyncio.create_task(
-            application.run_polling(
-                drop_pending_updates=True,
-                stop_signals=None,
-                close_loop=False,
-            )
-        )
+        updater = None
         try:
-            done, _ = await asyncio.wait(
-                (stop_waiter, poll_task), return_when=asyncio.FIRST_COMPLETED
-            )
-            if poll_task in done:
-                await poll_task  # re-raises fatal polling errors (Conflict)
-                return
-            # stop_event fired: shut polling down cleanly.
-            poll_task.cancel()
-            await asyncio.gather(poll_task, return_exceptions=True)
+            await application.initialize()
+            await application.start()
+            updater = getattr(application, "updater", None)
+            if updater is not None:
+                await updater.start_polling(drop_pending_updates=True)
+                logger.info("Telegram command listener: polling session started")
+            else:
+                logger.warning("Telegram Application has no updater — commands disabled")
+            await stop_event.wait()
         finally:
-            stop_waiter.cancel()
+            for step in (application.stop, application.shutdown):
+                try:
+                    result = step()
+                    if result is not None and hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    logger.exception("Error during Telegram application cleanup; continuing")
 
     async def stop(self) -> None:
         """Graceful stop for tests / shutdown paths that don't use stop_event."""
