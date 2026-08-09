@@ -57,6 +57,14 @@ def _html_line(key: str, value: str) -> str:
     return f"<b>{_html_escape(key)}</b>: {value}"
 
 
+def _num(v, default, fmt: str) -> str:
+    """None-safe number formatting. A key that exists with value None (e.g.
+    latencies before any trade has fired) must render as the default instead
+    of crashing on '{None:.0f}' — the /latency button was silent for exactly
+    this reason (2026-08-09)."""
+    return f"{v:{fmt}}" if isinstance(v, (int, float)) else f"{default:{fmt}}"
+
+
 def _html_money(v: Optional[float], signed: bool = False) -> str:
     return f"<code>{_fmt_money(v, signed=signed)}</code>"
 
@@ -265,13 +273,13 @@ def _html_risk_detail_lines(s: dict) -> list[str]:
     lines = [
         _html_line(
             "Daily PnL",
-            f"<code>{rd.get('daily_pnl_pct', 0.0):+.2%}</code> "
-            f"(halt at {rd.get('daily_halt_threshold_pct', 0.20):.0%})",
+            f"<code>{_num(rd.get('daily_pnl_pct'), 0.0, '+.2%')}</code> "
+            f"(halt at {_num(rd.get('daily_halt_threshold_pct'), 0.20, '.0%')})",
         ),
         _html_line(
             "Drawdown",
-            f"<code>{rd.get('drawdown_pct', 0.0):.2%}</code> "
-            f"(kill at {rd.get('kill_threshold_pct', 0.40):.0%})",
+            f"<code>{_num(rd.get('drawdown_pct'), 0.0, '.2%')}</code> "
+            f"(kill at {_num(rd.get('kill_threshold_pct'), 0.40, '.0%')})",
         ),
         _html_line("Daily halt", "<b>HALTED</b>" if s.get("daily_halted") else "<code>active</code>"),
         _html_line("Kill switch", "<b>TRIPPED</b>" if s.get("kill_switch_tripped") else "<code>active</code>"),
@@ -329,19 +337,23 @@ def _html_latency_lines(s: dict) -> list[str]:
     lines = [
         _html_line(
             "Tick->signal (p50/p95)",
-            f"<code>{lat.get('tick_to_signal_p50_ms', 0.0):.0f} / {lat.get('tick_to_signal_p95_ms', 0.0):.0f} ms</code>",
+            f"<code>{_num(lat.get('tick_to_signal_p50_ms'), 0.0, '.0f')} / "
+            f"{_num(lat.get('tick_to_signal_p95_ms'), 0.0, '.0f')} ms</code>",
         ),
         _html_line(
             "Tick->order (p50/p95)",
-            f"<code>{lat.get('tick_to_order_p50_ms', 0.0):.0f} / {lat.get('tick_to_order_p95_ms', 0.0):.0f} ms</code>",
+            f"<code>{_num(lat.get('tick_to_order_p50_ms'), 0.0, '.0f')} / "
+            f"{_num(lat.get('tick_to_order_p95_ms'), 0.0, '.0f')} ms</code>",
         ),
         _html_line(
             "Platform delay",
-            f"<code>{lat.get('platform_delay_ms', 250.0):.0f} ms</code> (CLOB taker-order delay)",
+            f"<code>{_num(lat.get('platform_delay_ms'), 250.0, '.0f')} ms</code> "
+            "(CLOB taker-order delay)",
         ),
         _html_line(
             "Window",
-            f"<code>{lat.get('window_s', 2.0):.1f} s</code> — verdict: {_html_escape(lat.get('verdict', 'n/a'))}",
+            f"<code>{_num(lat.get('window_s'), 2.0, '.1f')} s</code> — "
+            f"verdict: {_html_escape(lat.get('verdict', 'n/a'))}",
         ),
     ]
     return lines
