@@ -1620,12 +1620,19 @@ async def main() -> None:
     # the ledger is missing here we may be able to restore it from the last
     # Telegram backup (see engine/cloud_backup.py). Inert unless enabled.
     if cloud_backup.backup_enabled(settings):
-        outcome = await cloud_backup.restore_if_needed(
-            Path(settings.DATABASE_PATH),
-            settings.TELEGRAM_BOT_TOKEN,
-            settings.TELEGRAM_CHAT_ID,
-            timeout_s=settings.CLOUD_RESTORE_TIMEOUT_S,
-        )
+        try:
+            outcome = await cloud_backup.restore_if_needed(
+                Path(settings.DATABASE_PATH),
+                settings.TELEGRAM_BOT_TOKEN,
+                settings.TELEGRAM_CHAT_ID,
+                timeout_s=settings.CLOUD_RESTORE_TIMEOUT_S,
+            )
+        except Exception:
+            # A Telegram hiccup must never kill the whole bot on a cloud host:
+            # log it and start fresh — the ledger is recoverable later from a
+            # forwarded backup, but a dead process is useful to nobody.
+            logger.exception("Cloud restore attempt failed; starting fresh")
+            outcome = "fresh"
         logger.info("Cloud backup restore outcome: %s", outcome)
     app = TradingApp()
     try:
