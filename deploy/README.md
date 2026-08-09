@@ -102,6 +102,15 @@ The only no-credit-card cloud that can run this bot 24/7. Verified against
    repo URL → Render reads `deploy/render.yaml` and creates the `arb-bot`
    service. It builds (`pip install -r requirements.txt`) and starts
    (`python cloud_entry.py`) automatically.
+
+   > **Region matters — this is not optional.** The bot streams Binance.com's
+   > WebSocket, and Binance geo-blocks US IPs. A service in a US region
+   > (Oregon/Virginia/Ohio) gets **zero Binance data** and never trades
+   > (2026-08-09: the first deploy did exactly this — Polymarket healthy,
+   > Binance dead). The blueprint pins `region: frankfurt`; if you ever
+   > recreate the service manually, pick **Frankfurt** (or Singapore), never
+   > a US region. Render cannot change an existing service's region — you
+   > must delete and recreate.
 4. **Set the secrets** (service → Environment):
    - `TELEGRAM_BOT_TOKEN` — your existing bot token (same one as `.env`).
    - `TELEGRAM_CHAT_ID` — your existing chat id.

@@ -19,6 +19,11 @@ services:
     name: arb-bot
     runtime: python
     plan: free
+    # MUST be a non-US region: the bot streams Binance.com's WebSocket, and
+    # Binance geo-blocks US IPs (US access is Binance.US, a different product).
+    # In a US region (Oregon/Virginia/Ohio) the Binance feed gets zero messages
+    # and the bot never trades. Frankfurt is the default choice here.
+    region: frankfurt
     buildCommand: pip install -r requirements.txt
     startCommand: python cloud_entry.py
     healthCheckPath: /api/health
