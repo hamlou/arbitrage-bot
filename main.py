@@ -523,12 +523,16 @@ class TradingApp:
                 if market.resolved:
                     pnl = await self.broker.settle_position(market)
                     if pnl is not None:
-                        # Persist tracked excursions for whatever just settled.
-                        for t in [t for t in open_trades if t["market_id"] == market_id]:
-                            mfe = self._mfe.pop(t["id"], None)
-                            mae = self._mae.pop(t["id"], None)
-                            if mfe is not None and mae is not None:
-                                await self.db.set_trade_excursion(t["id"], mfe, mae)
+                        # Measurement only, after settlement, fully guarded — a
+                        # recording failure must not disturb the settlement.
+                        try:
+                            for t in [t for t in open_trades if t["market_id"] == market_id]:
+                                mfe = self._mfe.pop(t["id"], None)
+                                mae = self._mae.pop(t["id"], None)
+                                if mfe is not None and mae is not None:
+                                    await self.db.set_trade_excursion(t["id"], mfe, mae)
+                        except Exception:
+                            logger.exception("Could not persist excursions after settling %s", market_id)
                         await self.alerter.send_alert(
                             f"[{self.broker.mode}] Settled {market_id}: PnL ${pnl:.2f}",
                             level=AlertLevel.INFO,
@@ -1161,17 +1165,21 @@ class TradingApp:
 
     async def _try_early_exit(self, market: Market, trade_id: int, reason: str) -> None:
         try:
-            # Persist the tracked excursions now — the position is closing and
-            # will no longer be monitored.
-            mfe = self._mfe.pop(trade_id, None)
-            mae = self._mae.pop(trade_id, None)
-            if mfe is not None and mae is not None:
-                await self.db.set_trade_excursion(trade_id, mfe, mae)
+            # The EXIT is the only thing that matters here and runs first,
+            # untouched by any measurement: same close_position_early call,
+            # same fill, same PnL as before the analytics layer existed.
             pnl = await self.broker.close_position_early(market, trade_id, reason=reason)
             if pnl is not None:
-                # Arm post-exit sampling: did the market keep converging (or
-                # reverse) after we left? P_EXIT is the baseline sample; the
-                # rest come from _exit_probe_loop. Measurement only.
+                # --- measurement only, AFTER the exit, each piece guarded so
+                # a recording failure can never alter or delay what just
+                # happened ---
+                try:
+                    mfe = self._mfe.pop(trade_id, None)
+                    mae = self._mae.pop(trade_id, None)
+                    if mfe is not None and mae is not None:
+                        await self.db.set_trade_excursion(trade_id, mfe, mae)
+                except Exception:
+                    logger.exception("Could not persist excursions for trade %d", trade_id)
                 try:
                     trade = await self.db.get_trade(trade_id)
                     if trade and trade.get("side") and trade.get("entry_price"):
