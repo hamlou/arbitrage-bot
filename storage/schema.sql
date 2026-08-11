@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS signals (
     fired           INTEGER NOT NULL,          -- 0/1, did it pass thresholds
     reason          TEXT,                      -- why it fired or didn't
     binance_tick_age_s REAL,
-    book_depth_usd  REAL
+    book_depth_usd  REAL,
+    book_imbalance_pct REAL                 -- bid/(bid+ask) USD depth @5 levels on the target book (measurement-only, never gates)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id);

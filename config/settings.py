@@ -295,6 +295,10 @@ class Settings(BaseSettings):
     # How often the bot pushes a full status/stats digest to Telegram (hours).
     # In addition to the on-demand /status and /stats commands.
     TELEGRAM_STATUS_INTERVAL_HOURS: float = 6.0
+    # How often the exit-forensics digest (premature-vs-protective EDGE_REVERSAL
+    # split + freeze/live-gate progress) is pushed to Telegram. Pure reporting —
+    # closes the loop on the freeze rule without touching any threshold.
+    TELEGRAM_FORENSICS_INTERVAL_HOURS: float = 24.0
     # Whether to run the command listener (polling) so you can query the bot
     # with /status, /stats, /help instead of only receiving push alerts.
     TELEGRAM_COMMANDS_ENABLED: bool = True

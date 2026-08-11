@@ -391,3 +391,58 @@ def format_config_html(s: dict) -> str:
 
 def format_latency_html(s: dict) -> str:
     return "<b>LATENCY</b>\n" + "\n".join(_html_latency_lines(s))
+
+
+def format_forensics_digest(summary: dict) -> str:
+    """
+    Plain-text daily forensics digest (the /forensics content, also pushed
+    automatically once a day). Pure formatting of the summary dict built by
+    engine/exit_forensics.build_digest_summary — this closes the loop on the
+    freeze rule: the premature-vs-protective split and the run-progress gates
+    are pushed automatically instead of requiring a human to run
+    scripts/analyze_exits.py by hand.
+    """
+    n = summary.get("closed_trades", 0)
+    days = summary.get("days_elapsed", 0.0)
+    distinct = summary.get("distinct_trading_days", 0)
+    lines = [
+        "🔬 EXIT FORENSICS (daily digest)",
+        "=" * 30,
+        f"Closed trades      : {n}",
+        f"Days elapsed        : {days:.1f}",
+        f"Distinct trade days : {distinct}",
+        f"Net PnL             : {_fmt_money(summary.get('net_pnl_usd'), signed=True)}",
+        "",
+        "Per exit reason (net PnL):",
+    ]
+    by_reason = summary.get("by_reason") or {}
+    for reason, pnl in by_reason.items():
+        lines.append(f"  {reason:<14} {_fmt_money(pnl, signed=True)}")
+
+    rev_n = summary.get("reversals_n", 0)
+    prem_n = summary.get("premature_n", 0)
+    held_n = summary.get("held_won_n", 0)
+    prot_n = summary.get("protective_n", 0)
+    lines += [
+        "",
+        "EDGE_REVERSAL exits — premature vs protective:",
+        f"  PREMATURE (market hit target after we left): {prem_n} trades "
+        f"({_fmt_money(summary.get('premature_dollars'), signed=True)} of "
+        f"{_fmt_money(summary.get('reversal_dollars'), signed=True)} reversal loss)",
+        f"  Held side WON at settlement (cut too early):  {held_n}",
+        f"  Protective (kept falling):                    {prot_n}",
+        f"  No probe data yet:                            {summary.get('no_data_n', 0)}",
+        f"  Total reversals:                              {rev_n}",
+        "",
+        "Freeze gate (thresholds unlock at):",
+        f"  Trades: {n} / {summary.get('freeze_min_trades', 100)}",
+        f"  Days:   {days:.1f} / {summary.get('freeze_min_days', 7.0)}",
+        "",
+        "Live-trading gate (validate_paper_run.py):",
+        f"  Trades: {n} / {summary.get('live_min_trades', 200)}",
+        f"  Days:   {days:.1f} / {summary.get('live_min_days', 7.0)}",
+        f"  Distinct days: {distinct} / {summary.get('live_min_distinct_days', 5)}",
+        "",
+        "Measurement only — no thresholds changed.",
+    ]
+    return "\n".join(lines)

@@ -52,6 +52,26 @@ async def test_wal_survives_reconnect(tmp_path):
 # -- integrity check: OK path --------------------------------------------------
 
 
+async def test_log_signal_persists_book_imbalance(tmp_path):
+    """Regression: the signals table must persist the measurement-only
+    book_imbalance_pct field (2026-08-11) — the microstructure signal logged
+    on every evaluation so the 100+ trade bar can test whether losing entries
+    cluster on thin/one-sided books. Never gates anything; must survive the
+    round-trip."""
+    db_path = str(tmp_path / "imbalance.db")
+    db = Database(db_path)
+    await db.connect()
+    await db.log_signal(
+        market_id="m1", asset="BTC", implied_prob=0.5, polymarket_prob=0.51,
+        edge_pct=1.0, confidence=0.9, fired=True,
+        book_imbalance_pct=62.5,
+    )
+    signals = await db.get_signals(market_id="m1")
+    await db.close()
+    assert len(signals) == 1
+    assert signals[0]["book_imbalance_pct"] == 62.5
+
+
 async def test_healthy_database_prints_ok(tmp_path, capsys):
     db_path = str(tmp_path / "healthy.db")
     db = Database(db_path)

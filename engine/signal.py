@@ -455,6 +455,19 @@ class SignalEngine:
         # We always BUY the target side's token, so depth on that token's own
         # ask side is what matters — not a proxy inferred from the other book.
         depth_usd = target_book.depth_usd("ask")
+        # Book imbalance (measurement-only, added 2026-08-11): bid USD depth /
+        # (bid+ask) USD depth on the target token's book, 5 levels. A heavily
+        # one-sided book is a microstructure signal (buyers pressing vs sellers
+        # dumping) the price-only model cannot see. LOGGED ONLY — it never
+        # gates anything; we record it so that after the 100+ trade bar we can
+        # test whether losing entries cluster on thin/one-sided books. 0.5 =
+        # balanced, >0.5 = bid-heavy, <0.5 = ask-heavy; None when the book is
+        # empty on both sides.
+        bid_usd = target_book.depth_usd("bid")
+        ask_usd = target_book.depth_usd("ask")
+        book_imbalance_pct = (
+            (bid_usd / (bid_usd + ask_usd) * 100.0) if (bid_usd + ask_usd) > 0 else None
+        )
 
         # -- Fresh-move gate: only trade a REAL lag, never a drift --
         # The strategy's premise is "Polymarket LAGS a fresh Binance move."
@@ -588,10 +601,11 @@ class SignalEngine:
             fired=fired, reason=reason, model_used=model_used,
         )
         if log:
-            await self._log(sig, tick_age, depth_usd)
+            await self._log(sig, tick_age, depth_usd, book_imbalance_pct)
         return sig
 
-    async def _log(self, sig: Signal, tick_age: Optional[float], depth_usd: Optional[float] = None) -> None:
+    async def _log(self, sig: Signal, tick_age: Optional[float], depth_usd: Optional[float] = None,
+                   book_imbalance_pct: Optional[float] = None) -> None:
         await self.db.log_signal(
             market_id=sig.market.market_id,
             asset=sig.market.asset,
@@ -603,4 +617,5 @@ class SignalEngine:
             reason=f"[{sig.model_used}] {sig.reason}" if sig.model_used else sig.reason,
             binance_tick_age_s=tick_age,
             book_depth_usd=depth_usd,
+            book_imbalance_pct=book_imbalance_pct,
         )

@@ -27,11 +27,8 @@ from statistics import mean
 from typing import Optional
 
 from config.settings import Settings
+from engine.exit_forensics import classify_early_exits, recovery_pct
 from storage.db import Database
-
-
-def _recovery_pct(quote_price: float, entry_price: float) -> float:
-    return (quote_price - entry_price) / entry_price if entry_price else 0.0
 
 
 async def analyze(db_path: str) -> int:
@@ -65,23 +62,12 @@ async def analyze(db_path: str) -> int:
                   f"  {reason:<14} n={len(group):<4} net={sum(t['realized_pnl_usd'] or 0 for t in group):+8.2f}  (no excursion data)")
 
         # --- 2. EDGE_REVERSAL classification --------------------------------
-        reversals = [t for t in trades if t.get("exit_reason") == "EDGE_REVERSAL"]
+        cls = classify_early_exits(trades, probes, reprice_target)
+        reversals = cls["reversals"]
+        premature, held_won, protective, no_data = (
+            cls["premature"], cls["held_won"], cls["protective"], cls["no_data"],
+        )
         print(f"\n--- EDGE_REVERSAL classification (n={len(reversals)}) ---")
-        premature, held_won, protective, no_data = [], [], [], []
-        for t in reversals:
-            samples = sorted(by_trade.get(t["id"], []), key=lambda p: p["ts"])
-            if not samples:
-                no_data.append(t)
-                continue
-            max_recovery = max(_recovery_pct(p["quote_price"], t["entry_price"]) for p in samples
-                               if p["sample_label"] != "P_SETTLED")
-            settled = next((p for p in samples if p["sample_label"] == "P_SETTLED"), None)
-            if max_recovery >= reprice_target:
-                premature.append((t, max_recovery, settled))
-            elif settled is not None and settled["quote_price"] >= 1.0:
-                held_won.append((t, max_recovery, settled))
-            else:
-                protective.append((t, max_recovery, settled))
 
         loss_dollars = sum(t["realized_pnl_usd"] or 0 for t in reversals)
         prem_dollars = sum(t["realized_pnl_usd"] or 0 for t, _, _ in premature)

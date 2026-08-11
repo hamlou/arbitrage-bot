@@ -136,6 +136,50 @@ This is the third attempt at a clean window. Every push restarts the cloud
 bot and resets the clock — the scarce resource is an untouched sample, not
 another lever.
 
+## 8. THE TWO GATES — RECONCILED (added 2026-08-11)
+
+There are two sample-size gates in the repo and they deliberately DISAGREE,
+because they govern different decisions. Decided here so nobody picks the
+easier number at trade #110:
+
+| Decision | Gate | Numbers | Where |
+|---|---|---|---|
+| "Can we re-tune a threshold?" (the freeze) | FREEZE_MIN_TRADES / FREEZE_MIN_DAYS | **≥100 closed trades AND ≥7 days** | main.py + this doc §7 |
+| "Is the paper run good enough for live money?" (go/no-go) | scripts/validate_paper_run.py | **≥200 trades AND ≥7 days AND ≥5 distinct trading days**, plus win rate ≥70%, positive expectancy, drawdown < kill | validate_paper_run.py |
+
+At trade #110 the FREEZE numbers govern whether any threshold can be touched
+(no — until 100 AND 7). The LIVE numbers govern the separate go/no-go for
+live money, which is a higher bar by design (distinct trading days = regime
+coverage, not just calendar span). Both are surfaced automatically in the
+daily Telegram forensics digest, so the gates stay visible instead of being
+an honor-system memory.
+
+## 9. DAILY FORENSICS DIGEST + BOOK-IMBALANCE LOGGING (added 2026-08-11)
+
+Closing the loop on the freeze rule WITHOUT touching any threshold — pure
+reporting and measurement, per the external review's "reporting/reconcilia-
+tion, not trading logic" direction:
+
+1. **Daily Telegram forensics digest** (`_telegram_forensics_loop`, every
+   `TELEGRAM_FORENSICS_INTERVAL_HOURS`=24h): pushes the premature-vs-
+   protective EDGE_REVERSAL split (from the exit_probes data), per-exit-
+   reason net PnL, trade count / days / distinct trading days, and progress
+   against BOTH gates (§8). Nothing has to be run by hand anymore;
+   `scripts/analyze_exits.py` now imports the same classification from
+   `engine/exit_forensics.py` so the manual tool and the digest can't drift.
+2. **Book-imbalance logging** (measurement-only): every signal evaluation now
+   records `book_imbalance_pct` — bid/(bid+ask) USD depth on the target
+   token's book — computed from Polymarket books the bot already holds (no
+   new vendor, no new subscription). Logged ONLY, never gates. After the
+   100+ trade bar we can test whether losing entries cluster on thin/one-
+   sided books before ever letting it gate a trade.
+
+Not shipped (explicitly deferred, not forgotten): Binance/Coinbase depth
+streams, funding rate / open interest, and DVOL as logged fields. Those need
+new network integrations (a Binance @depth subscription, futures endpoints,
+Deribit) and are a larger build — worth doing as one focused, tested push
+after this one settles, still measurement-only.
+
 ---
 
 *Continue logging every intervention below — a run with a documented human

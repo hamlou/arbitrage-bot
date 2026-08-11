@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional, Union
 
+from alerts.status_report import format_forensics_digest
 from alerts.telegram import AlertLevel, build_alerter, build_reporter
 from config.settings import settings
 from engine import cloud_backup
@@ -28,6 +29,7 @@ from data.polymarket_ws_feed import PolymarketWSFeed
 from engine.broker_live import LiveBroker, LiveTradingNotEnabledError, build_live_broker
 from engine.broker_paper import PaperBroker, SumToOneEdgeLostError
 from engine.calibration import load_calibration
+from engine.exit_forensics import build_digest_summary
 from engine.feed_health import FeedHealth
 from engine.fees import round_trip_fee_pct
 from engine.lag_tracker import LagMeasurement, LagTracker
@@ -55,6 +57,25 @@ EXIT_PROBE_SCHEDULE = (("P_5S", 5), ("P_15S", 15), ("P_30S", 30), ("P_60S", 60),
 EXIT_PROBE_SETTLE_AT_S = 130.0    # try settlement after this many seconds
 EXIT_PROBE_MAX_WAIT_S = 400.0     # give up on a probe job after this (no outcome found)
 MAX_CONCURRENT_MARKET_EVALS = 10   # cap concurrency to stay within CLOB rate limits
+
+# The two sample-size gates, reconciled in ONE place (reported daily by the
+# forensics digest so they stay visible, not honor-system). They govern
+# DIFFERENT decisions and deliberately disagree:
+#   FREEZE_*   = when we may re-tune THRESHOLDS (the freeze rule in
+#                docs/VALIDATION_RUN_2026_08b.md). The freeze is about
+#                protecting the sample from our own over-fitting — 100 trades
+#                + 7 days is the minimum evidence before touching a threshold.
+#   LIVE_GATE_* = when the paper run is even worth considering for live money
+#                (scripts/validate_paper_run.py): 200 trades, 7 days, AND 5
+#                distinct trading days (regime coverage, not just calendar
+#                span), plus win rate / expectancy / drawdown checks.
+# At trade #110 the FREEZE numbers are the ones that govern "can we touch a
+# threshold again"; the LIVE numbers govern the separate go/no-go decision.
+FREEZE_MIN_TRADES = 100
+FREEZE_MIN_DAYS = 7.0
+LIVE_GATE_MIN_TRADES = 200
+LIVE_GATE_MIN_DAYS = 7.0
+LIVE_GATE_MIN_DISTINCT_DAYS = 5
 
 
 def fast_path_should_run(
@@ -1752,6 +1773,42 @@ class TradingApp:
             except asyncio.TimeoutError:
                 continue
 
+    async def _telegram_forensics_loop(self) -> None:
+        """
+        Daily Telegram forensics digest — closes the loop on the freeze rule
+        WITHOUT touching any threshold: pushes the premature-vs-protective
+        EDGE_REVERSAL split and run-progress gates automatically, so nobody
+        has to run scripts/analyze_exits.py by hand to see whether the
+        reversal exit is cutting good trades. Pure reporting: reads the DB,
+        formats, sends. Swallow-and-log — a digest failure must never affect
+        trading.
+        """
+        if not self.telegram_reporter.enabled:
+            return
+        interval_s = max(3600.0, settings.TELEGRAM_FORENSICS_INTERVAL_HOURS * 3600.0)
+        while not self._shutdown.is_set():
+            try:
+                trades = await self.db.get_all_trades(mode="PAPER")
+                probes = await self.db.get_exit_probes()
+                summary = build_digest_summary(
+                    all_trades=trades,
+                    probes=probes,
+                    reprice_target=settings.REPRICE_EXIT_GAIN_PCT,
+                    freeze_min_trades=FREEZE_MIN_TRADES,
+                    freeze_min_days=FREEZE_MIN_DAYS,
+                    live_min_trades=LIVE_GATE_MIN_TRADES,
+                    live_min_days=LIVE_GATE_MIN_DAYS,
+                    live_min_distinct_days=LIVE_GATE_MIN_DISTINCT_DAYS,
+                )
+                text = format_forensics_digest(summary)
+                await self.telegram_reporter.send_text(text)
+            except Exception:
+                logger.exception("Telegram forensics digest failed; continuing")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                continue
+
     async def _telegram_command_loop(self) -> None:
         """
         PTB polling for /status /stats /help inside the app's own event loop.
@@ -1804,6 +1861,7 @@ class TradingApp:
         ]
         if self.telegram_reporter.enabled:
             tasks.append(asyncio.create_task(self._telegram_status_loop(), name="telegram_status"))
+            tasks.append(asyncio.create_task(self._telegram_forensics_loop(), name="telegram_forensics"))
             if settings.TELEGRAM_COMMANDS_ENABLED:
                 tasks.append(asyncio.create_task(self._telegram_command_loop(), name="telegram_commands"))
         if cloud_backup.backup_enabled(settings):

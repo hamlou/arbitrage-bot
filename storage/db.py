@@ -111,6 +111,21 @@ class Database:
             if column not in existing_columns:
                 logger.info("Migrating trades table: adding missing column '%s'", column)
                 await conn.execute(ddl)
+
+        # Same treatment for the signals table (measurement columns added
+        # after the table shipped): signal rows in older DB files must get
+        # the new NULLable columns too, or the audit layer breaks on them.
+        cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'")
+        if await cur.fetchone() is not None:
+            cur = await conn.execute("PRAGMA table_info(signals)")
+            sig_columns = {row[1] for row in await cur.fetchall()}
+            # Book imbalance (2026-08-11): bid/(bid+ask) USD depth on the
+            # target token's book at signal time. Measurement-only — logged so
+            # we can later test whether losing entries cluster on thin/one-
+            # sided books, never gates anything.
+            if "book_imbalance_pct" not in sig_columns:
+                logger.info("Migrating signals table: adding missing column 'book_imbalance_pct'")
+                await conn.execute("ALTER TABLE signals ADD COLUMN book_imbalance_pct REAL")
         await conn.commit()
 
     def _require_conn(self) -> aiosqlite.Connection:
@@ -133,19 +148,21 @@ class Database:
         reason: str = "",
         binance_tick_age_s: Optional[float] = None,
         book_depth_usd: Optional[float] = None,
+        book_imbalance_pct: Optional[float] = None,
     ) -> int:
         conn = self._require_conn()
         cur = await conn.execute(
             """
             INSERT INTO signals
                 (ts, market_id, asset, implied_prob, polymarket_prob, edge_pct,
-                 confidence, fired, reason, binance_tick_age_s, book_depth_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 confidence, fired, reason, binance_tick_age_s, book_depth_usd,
+                 book_imbalance_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.time(), market_id, asset, implied_prob, polymarket_prob,
                 edge_pct, confidence, int(fired), reason, binance_tick_age_s,
-                book_depth_usd,
+                book_depth_usd, book_imbalance_pct,
             ),
         )
         await conn.commit()
