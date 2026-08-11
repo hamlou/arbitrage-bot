@@ -114,6 +114,25 @@ processes here, with timestamps.
 | Timestamp (UTC) | Action |
 |---|---|
 | 2026-08-08 ~23:00 | Run started (commit `4c5deb4`). Previous run retired and archived; fee rate corrected to 0.06; lag trigger widened to 0.03%; single-instance guard enabled. |
+| 2026-08-09 | Mechanical-loss fixes pushed: fill-price cap on the actual fill (`broker_paper.py`), EDGE_REVERSAL min-hold 60s, phantom-gain exit fix (decision and fill share the walked bid), sum-to-one pre-quote walk + reverse-vs-hold. Run data before these fixes is NOT comparable to after. |
+| 2026-08-11 | **Final pre-freeze push** (fee-aware REPRICE exit floor + entry cap 0.70 → 0.58, provisional). Honest state after the two mechanical-fix pushes: 18 live trades, 12 wins / 6 losses (67%), net −$94.64 (gross −$58.46, fees $36.18 — fees are inside the net, not additive). Loss breakdown: all 6 losses are EDGE_REVERSAL; 3 of them (0.60/0.63/0.66 entries) = −$131 of the −$157 loss total, and 0 of 12 wins entered above 0.52. That 3/3 cluster motivated the provisional 0.58 cap — justified primarily by the out-of-sample 79-market study (losers avg 0.57, winners 0.39), with the live fills as support, NOT as validation of a number fit to those same trades. The signal gate logs every blocked entry (reason=entry ask > max), so the forward record will judge the cap. |
+
+## 7. FREEZE RULE (binding, added 2026-08-11)
+
+From this push forward, the run is hands-off. **No pattern-derived threshold
+edits until ≥ 100 closed trades AND ≥ 7 days, whichever is later.**
+
+- Allowed any time: pure bug fixes (things that are wrong, not tuned).
+- NOT allowed: threshold changes derived from the latest loss cluster
+  (caps, gains, hold times, gate values) — no matter how compelling the
+  story is. The next loss cluster will arrive; do not tune it.
+- The 0.58 cap is provisional by design: its forward block-log (signals
+  table, `entry ask > max`) is the evidence it will be judged on at 100+
+  trades. Re-evaluate then; do not touch it before.
+
+This is the third attempt at a clean window. Every push restarts the cloud
+bot and resets the clock — the scarce resource is an untouched sample, not
+another lever.
 
 ---
 

@@ -526,6 +526,49 @@ async def test_reprice_exit_banks_convergence(app_settings):
         await app.db.close()
 
 
+async def test_reprice_exit_requires_fee_clearing_gain(app_settings):
+    """
+    The REPRICE exit must be fee-aware like the entry gate. On a very cheap
+    entry the flat REPRICE_EXIT_GAIN_PCT can sit BELOW break-even after the
+    price-dependent round-trip fee (fee_rate * p * (1-p) per share, paid
+    twice): a +10% token gain on a 0.10 entry nets ~ -1.3% after fees. The
+    fee floor (round_trip_fee_pct / entry + REPRICE_EXIT_FEE_MARGIN) must
+    refuse that exit and only fire once the gain clears it.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.09, 0.10)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        assert fill.avg_price == pytest.approx(0.10, abs=0.005)
+
+        # +10% token gain (0.10 -> 0.11): below the fee floor (~11.3% + 1%
+        # margin) — the "REPRICE win" would be a net loss, so it must NOT fire.
+        plus_10 = make_book(market.token_id_yes, 0.11, 0.12)
+        app.feed.books[market.token_id_yes] = plus_10
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 1  # still held
+
+        # +20% token gain (0.10 -> 0.12): clears the floor — REPRICE fires
+        # and nets positive after the modeled round-trip fee.
+        plus_20 = make_book(market.token_id_yes, 0.12, 0.13)
+        app.feed.books[market.token_id_yes] = plus_20
+        await app._check_early_exits(equity=1000)
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "REPRICE"
+        assert closed[0]["realized_pnl_usd"] > 0
+    finally:
+        await app.db.close()
+
+
 async def test_reprice_exit_does_not_fire_on_phantom_mid_gain(app_settings):
     """
     Regression for the phantom-gain bug: the exit DECISION used book.mid

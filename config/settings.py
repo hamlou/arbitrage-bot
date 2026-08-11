@@ -88,7 +88,16 @@ class Settings(BaseSettings):
     # markets, winners entered at avg 0.39 while the 12 losers entered at avg
     # 0.57 — the expensive entries are where the losses concentrate. A 0.70
     # cap blocks 25% of the losers for the cost of only 1% of the winners.
-    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.70
+    # Lowered 0.70 -> 0.58 on 2026-08-11 (PROVISIONAL — see the freeze rule in
+    # docs/VALIDATION_RUN_2026_08b.md): live fills agree with the 79-market
+    # study — all 3 live entries at >= 0.60 lost (0.60/0.63/0.66 -> -$131 net)
+    # while 0 of 12 winners entered above 0.52. Expensive entries carry
+    # open-ended downside (a 0.63 NO collapsed to 0.12) against capped 10%
+    # upside, and the fee savings at high prices are real but small. 0.58 sits
+    # just under the historical loser average (0.57) with margin; the signal
+    # gate logs every blocked entry (reason=entry ask > max), so the forward
+    # record will judge this — re-evaluate at 100+ trades, do NOT tune before.
+    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.58
     # Polymarket's crypto taker fee RATE — NOT a flat fraction. The per-share
     # fee is fee_rate * p * (1 - p); as a fraction of what you spend that is
     # fee_rate * (1 - p) per side (~3% of notional at p=0.50, ~1.2% at
@@ -218,6 +227,16 @@ class Settings(BaseSettings):
     #     exits (TAKE_PROFIT / EDGE_REVERSAL / settlement) take over.
     REPRICE_EXIT_GAIN_PCT: float = 0.10
     REPRICE_EXIT_MAX_HOLD_S: float = 240.0
+    # Fee-aware exit floor (added 2026-08-11): the entry gate already nets
+    # the price-dependent round-trip fee (round_trip_fee_pct) before allowing
+    # a trade; the exit must too, or a "REPRICE win" can be a loss after fees
+    # on cheap entries where the flat REPRICE_EXIT_GAIN_PCT sits below
+    # break-even (p < ~0.20). The actual exit threshold is
+    #   max(REPRICE_EXIT_GAIN_PCT, round_trip_fee_pct(entry, exit) / entry
+    #       + REPRICE_EXIT_FEE_MARGIN)
+    # At mid prices the flat 10% already clears the fee, so this only binds
+    # on cheap entries.
+    REPRICE_EXIT_FEE_MARGIN: float = 0.01
 
     # --- Sum-to-one (combo) arbitrage -----------------------------------------
     # If YES_ask + NO_ask (net of modeled fees) is under $1 by at least this
@@ -364,6 +383,7 @@ class Settings(BaseSettings):
         "SUM_TO_ONE_MAX_POSITION_PCT",
         "EDGE_REVERSAL_EXIT_THRESHOLD_PCT",
         "REPRICE_EXIT_GAIN_PCT",
+        "REPRICE_EXIT_FEE_MARGIN",
         "EDGE_THRESHOLD_PCT",
         "MIN_CONFIDENCE",
     )

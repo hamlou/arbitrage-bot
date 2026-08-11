@@ -29,6 +29,7 @@ from engine.broker_live import LiveBroker, LiveTradingNotEnabledError, build_liv
 from engine.broker_paper import PaperBroker, SumToOneEdgeLostError
 from engine.calibration import load_calibration
 from engine.feed_health import FeedHealth
+from engine.fees import round_trip_fee_pct
 from engine.lag_tracker import LagMeasurement, LagTracker
 from engine.latency import LatencyTracker
 from engine.risk import RiskManager, SignalForSizing
@@ -1086,9 +1087,21 @@ class TradingApp:
             # normal exits take over.
             entry_ts = t.get("entry_ts") or 0.0
             held_s = time.time() - entry_ts
+            # Fee-aware exit floor (the entry gate already nets fees via
+            # round_trip_fee_pct; the exit must too): never bank a "REPRICE"
+            # win whose token gain doesn't clear the real price-dependent
+            # round-trip taker fee plus a small margin. At mid prices the
+            # flat REPRICE_EXIT_GAIN_PCT already clears it, so this only
+            # binds on cheap entries (p < ~0.20) where 10% can sit below
+            # break-even — a "win" that is actually a loss after fees.
+            fee_hurdle_pct = round_trip_fee_pct(entry_price, exit_price) / entry_price
+            min_exit_pct = max(
+                settings.REPRICE_EXIT_GAIN_PCT,
+                fee_hurdle_pct + settings.REPRICE_EXIT_FEE_MARGIN,
+            )
             if (
                 held_s <= settings.REPRICE_EXIT_MAX_HOLD_S
-                and unrealized_pct >= settings.REPRICE_EXIT_GAIN_PCT
+                and unrealized_pct >= min_exit_pct
             ):
                 await self._try_early_exit(market, t["id"], "REPRICE")
                 continue
