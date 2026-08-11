@@ -206,6 +206,11 @@ class TradingApp:
         # the "Gamma called every single second" inefficiency — discovery now
         # runs on its own, slower, independent schedule.
         self._known_markets: dict[str, Market] = {}
+        # Consecutive discovery passes that returned ZERO markets. When this
+        # reaches settings.DISCOVERY_EMPTY_ALERT_AFTER_PASSES, alert Telegram
+        # (once per episode) — the universe is kept intact meanwhile, so a
+        # stale/empty Gamma slice never halts trading (see the discovery loop).
+        self._discovery_dry_passes: int = 0
         # Lever 1 (2026-08-08): the risk-free sum-to-one universe — ALL binary
         # market categories, not just BTC/ETH up/down. Kept in a SEPARATE dict
         # so the crypto-only directional signal engine never sees non-crypto
@@ -442,10 +447,50 @@ class TradingApp:
                                 logger.debug("No Binance price yet to use as reference for new market %s", m.market_id)
                     self._known_markets[m.market_id] = m
 
+                # Prune the universe ONLY with positive evidence a market is
+                # gone: (a) it was absent from a NON-EMPTY discovery result, or
+                # (b) its window has genuinely ended by wall clock. An EMPTY
+                # discovery result is NOT evidence — Gamma intermittently
+                # serves stale cached slices with zero live windows (verified
+                # live 2026-08-11: 0 live BTC/ETH windows across 40 pages
+                # while the status page said "operational"). The old code
+                # treated empty == "all markets gone" and wiped EVERYTHING:
+                # token_ids became empty -> ws_feed.update_assets([]) emptied
+                # the subscription -> the WS never connected -> the Polymarket
+                # feed went stale -> the feed-health gate halted ALL trading.
+                # One bad API page used to knock the bot out for hours.
+                now = time.time()
+                discovery_healthy = bool(markets)
                 active_ids = {m.market_id for m in markets}
-                for stale_id in list(self._known_markets.keys()):
-                    if stale_id not in active_ids and stale_id not in self._open_position_market_ids:
+                for stale_id, stale_m in list(self._known_markets.items()):
+                    if stale_id in self._open_position_market_ids:
+                        continue  # held until settled, never pruned by discovery
+                    expired = stale_m.expires_at_ts is not None and stale_m.expires_at_ts < now
+                    if (discovery_healthy and stale_id not in active_ids) or expired:
                         del self._known_markets[stale_id]
+
+                # Discovery-dry alert: a stale/empty API slice means the bot is
+                # blind but NOT broken. Alert the user (once per episode) instead
+                # of silently idling — the old silent behavior is exactly how
+                # "why no trades? only backup.db" happens.
+                if discovery_healthy:
+                    if self._discovery_dry_passes >= settings.DISCOVERY_EMPTY_ALERT_AFTER_PASSES:
+                        await self.alerter.send_alert(
+                            "Discovery recovered: Gamma API serving live markets again "
+                            f"({len(markets)} windows found).",
+                            level=AlertLevel.INFO,
+                        )
+                    self._discovery_dry_passes = 0
+                else:
+                    self._discovery_dry_passes += 1
+                    if self._discovery_dry_passes == settings.DISCOVERY_EMPTY_ALERT_AFTER_PASSES:
+                        await self.alerter.send_alert(
+                            "⚠️ Discovery found 0 markets for several passes — Gamma API is "
+                            "serving a stale/empty slice. Keeping the last-known markets "
+                            f"({len(self._known_markets)} windows) and WS subscriptions so "
+                            "trading can resume instantly when the API recovers.",
+                            level=AlertLevel.WARNING,
+                        )
 
                 # Lever 1: widen the risk-free sum-to-one scan to all binary
                 # categories. Separate universe, separate dict — the
@@ -468,7 +513,19 @@ class TradingApp:
                     for mid, m in self._sto_markets.items():
                         if mid not in active_sto and mid in self._open_position_market_ids:
                             active_sto[mid] = m
-                    self._sto_markets = active_sto
+                    # SAME stale-slice guard as the directional universe: an
+                    # empty binary-market result must not wipe the sum-to-one
+                    # universe. Only prune from it when discovery was healthy
+                    # AND the market is gone from the active set (or expired).
+                    if sto_markets:
+                        self._sto_markets = active_sto
+                    else:
+                        for mid, m in list(self._sto_markets.items()):
+                            if mid in self._open_position_market_ids:
+                                continue
+                            expired = m.expires_at_ts is not None and m.expires_at_ts < now
+                            if mid not in active_sto and expired:
+                                del self._sto_markets[mid]
 
                 token_ids = []
                 for m in self._known_markets.values():

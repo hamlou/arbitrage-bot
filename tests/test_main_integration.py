@@ -237,6 +237,117 @@ async def test_early_first_sighting_does_trust_reference_price(app_settings):
         await app.db.close()
 
 
+async def test_empty_discovery_keeps_known_markets_and_ws_subscription(app_settings, caplog):
+    """
+    Regression test for the discovery-dry cascade (verified live 2026-08-11):
+    Gamma intermittently serves stale cached slices with ZERO live windows.
+    The old code treated an empty discovery result as "all markets gone" and
+    wiped _known_markets, which emptied the WS subscription (update_assets([])),
+    which made the Polymarket feed go stale, which flipped the feed-health gate
+    to unhealthy and halted ALL trading. An empty result is an API failure,
+    NOT evidence markets vanished — the last-known universe must survive so
+    the WS stays subscribed and trading resumes the moment the API recovers.
+    """
+    app = await build_app(app_settings)
+    try:
+        # Seed a known market (as if discovered in a previous, healthy pass).
+        market = make_market(market_id="survivor", reference_price=65000)
+        app._known_markets[market.market_id] = market
+        app.ws_feed.update_assets([market.token_id_yes, market.token_id_no])
+        assert set(app.ws_feed.asset_ids) == {market.token_id_yes, market.token_id_no}
+
+        # Discovery returns NOTHING (stale/empty Gamma slice). The fake feed
+        # has no discover_binary_markets; override it so the sum-to-one leg
+        # also returns empty (matching the stale-slice condition) instead of
+        # raising.
+        async def empty_binary(*a, **k):
+            return []
+
+        app.feed.discover_binary_markets = empty_binary  # type: ignore[attr-defined]
+
+        async def stop_after_one(*args, **kwargs):
+            raise StopAsyncIteration
+
+        original_sleep = asyncio.sleep
+        asyncio.sleep = stop_after_one  # type: ignore[assignment]
+        try:
+            with caplog.at_level(logging.DEBUG, logger="main"):
+                try:
+                    await app._market_discovery_loop()
+                except StopAsyncIteration:
+                    pass
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        # THE FIX: the known market survives the empty discovery pass, and the
+        # WS subscription is NOT emptied.
+        assert market.market_id in app._known_markets
+        assert set(app.ws_feed.asset_ids) == {market.token_id_yes, market.token_id_no}
+        assert app._discovery_dry_passes == 1  # counter armed for the alert
+    finally:
+        await app.db.close()
+
+
+async def test_empty_discovery_alerts_telegram_after_threshold_passes(app_settings, caplog):
+    """The bot must not silently idle when the API goes dry: after
+    DISCOVERY_EMPTY_ALERT_AFTER_PASSES consecutive empty discovery passes, a
+    Telegram alert fires. This is what turns the old silent "why no trades?"
+    mystery into an explicit notification."""
+    app = await build_app(app_settings)
+    try:
+        sent: list[str] = []
+
+        async def fake_alert(message: str, level=None):
+            sent.append(message)
+
+        app.alerter.send_alert = fake_alert  # type: ignore[method-assign]
+        async def empty_binary(*a, **k):
+            return []
+
+        app.feed.discover_binary_markets = empty_binary  # type: ignore[attr-defined]
+
+        # One healthy pass first (arms the counter reset path), then two empty
+        # passes; threshold is 2 in this test so the alert fires on pass 2.
+        settings_module.settings.DISCOVERY_EMPTY_ALERT_AFTER_PASSES = 2
+
+        async def run_pass() -> None:
+            async def stop_after_one(*args, **kwargs):
+                raise StopAsyncIteration
+
+            original_sleep = asyncio.sleep
+            asyncio.sleep = stop_after_one  # type: ignore[assignment]
+            try:
+                try:
+                    await app._market_discovery_loop()
+                except StopAsyncIteration:
+                    pass
+            finally:
+                asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        # Pass 1: healthy (a market IS discovered) -> counter stays 0, no alert.
+        m1 = make_market(market_id="m_healthy", reference_price=65000)
+        app.feed.register(m1, make_book(m1.token_id_yes, 0.49, 0.51), make_book(m1.token_id_no, 0.49, 0.51))
+        await run_pass()
+        assert app._discovery_dry_passes == 0
+        assert not sent
+
+        # Passes 2-3: discovery goes empty -> counter climbs -> alert fires.
+        app.feed._by_id.clear()
+        app.feed.books.clear()
+        await run_pass()
+        await run_pass()
+        assert app._discovery_dry_passes == 2
+        assert any("0 markets" in s for s in sent), sent
+
+        # Recovery pass: counter resets, recovery alert fires.
+        app.feed.register(m1, make_book(m1.token_id_yes, 0.49, 0.51), make_book(m1.token_id_no, 0.49, 0.51))
+        await run_pass()
+        assert app._discovery_dry_passes == 0
+        assert any("recovered" in s for s in sent), sent
+    finally:
+        await app.db.close()
+
+
 async def test_full_pipeline_places_a_trade_on_a_clear_edge(app_settings):
     app = await build_app(app_settings)
     try:

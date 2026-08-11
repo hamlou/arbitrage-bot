@@ -264,6 +264,15 @@ class Settings(BaseSettings):
     # Decoupled from the (much faster) per-cycle signal evaluation loop — no
     # reason to re-hit Gamma every second just to catch new 5/15-min markets.
     MARKET_DISCOVERY_INTERVAL_S: float = 3.0
+    # Discovery-dry tolerance: Gamma intermittently serves stale cached slices
+    # that contain NO live windows at all (verified live 2026-08-11 — 0 live
+    # BTC/ETH windows across 40 paginated pages while the API status page said
+    # "operational"). When a pass returns zero markets we must NOT wipe the
+    # known universe (that empties the WS subscription, which flips the feed-
+    # health gate to unhealthy, which halts trading) — see main.py. After this
+    # many CONSECUTIVE empty discovery passes, alert Telegram instead of
+    # silently idling. 3 passes x 3s interval = ~9s before the first alert.
+    DISCOVERY_EMPTY_ALERT_AFTER_PASSES: int = 3
 
     # --- Liquidity threshold (lowered 50k -> 5k on 08-04, -> 1k on 08-06) --
     # Verified live 2026-08-06: Gamma's `liquidity` field is NOT reliable —
