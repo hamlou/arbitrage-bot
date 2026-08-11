@@ -505,12 +505,18 @@ class TradingApp:
                 else:
                     self._discovery_dry_passes += 1
                     if self._discovery_dry_passes == settings.DISCOVERY_EMPTY_ALERT_AFTER_PASSES:
+                        # CRITICAL, not WARNING: a stale API means the bot is
+                        # blind and cannot trade at all — the same severity
+                        # class as the kill switch. CRITICAL alerts bypass the
+                        # /mute toggle (a mute must never hide this), which is
+                        # exactly the "why no trades? only backup.db" silence
+                        # this alert exists to prevent.
                         await self.alerter.send_alert(
-                            "⚠️ Discovery found 0 markets for several passes — Gamma API is "
+                            "🚨 Discovery found 0 markets for several passes — Gamma API is "
                             "serving a stale/empty slice. Keeping the last-known markets "
                             f"({len(self._known_markets)} windows) and WS subscriptions so "
                             "trading can resume instantly when the API recovers.",
-                            level=AlertLevel.WARNING,
+                            level=AlertLevel.CRITICAL,
                         )
 
                 # Lever 1: widen the risk-free sum-to-one scan to all binary
