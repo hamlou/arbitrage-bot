@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_price      REAL,
     exit_reason     TEXT,                      -- SETTLED / MANUAL_EXIT / TAKE_PROFIT / EDGE_REVERSAL / ...
     realized_pnl_usd REAL,
-    status          TEXT    NOT NULL DEFAULT 'OPEN'  -- OPEN / CLOSED
+    status          TEXT    NOT NULL DEFAULT 'OPEN',  -- OPEN / CLOSED
+    mfe_pct         REAL,                      -- max favorable excursion, fraction vs entry (measurement only)
+    mae_pct         REAL                       -- max adverse excursion, fraction vs entry (negative; measurement only)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -115,3 +117,19 @@ CREATE TABLE IF NOT EXISTS lag_events (
     timed_out        INTEGER NOT NULL DEFAULT 0 -- 1 = never repriced within LAG_TRACK_TIMEOUT_S
 );
 CREATE INDEX IF NOT EXISTS idx_lag_events_ts ON lag_events(ts);
+
+-- Post-exit price probes (added 2026-08-11, measurement only): after an
+-- early exit (REPRICE / TAKE_PROFIT / EDGE_REVERSAL), the bot samples the
+-- held token's price at T+5/15/30/60/120s and at settlement. This is the
+-- premature-exit detector: did the market reprice to a win AFTER we left?
+-- Filled by main.py's _exit_probe_loop; consumed by scripts/analyze_exits.py.
+CREATE TABLE IF NOT EXISTS exit_probes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id     INTEGER NOT NULL REFERENCES trades(id),
+    ts           REAL    NOT NULL,             -- unix epoch seconds of the sample
+    sample_label TEXT    NOT NULL,             -- P_EXIT / P_5S / P_15S / P_30S / P_60S / P_120S / P_SETTLED
+    quote_price  REAL    NOT NULL,             -- mid of the HELD token at sample time (1.0/0.0 at settlement)
+    entry_price  REAL    NOT NULL,             -- denormalized so recovery = (quote - entry)/entry
+    outcome      TEXT                          -- market outcome at settlement (YES/NO), else NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exit_probes_trade ON exit_probes(trade_id);

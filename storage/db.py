@@ -102,6 +102,10 @@ class Database:
             "slippage_pct": "ALTER TABLE trades ADD COLUMN slippage_pct REAL",
             "decision_best_ask": "ALTER TABLE trades ADD COLUMN decision_best_ask REAL",
             "fill_best_ask": "ALTER TABLE trades ADD COLUMN fill_best_ask REAL",
+            # Exit-excursion measurement (2026-08-11): max favorable/adverse
+            # excursion per trade, tracked in main.py and persisted at close.
+            "mfe_pct": "ALTER TABLE trades ADD COLUMN mfe_pct REAL",
+            "mae_pct": "ALTER TABLE trades ADD COLUMN mae_pct REAL",
         }
         for column, ddl in migrations.items():
             if column not in existing_columns:
@@ -221,6 +225,48 @@ class Database:
             (time.time(), exit_price, exit_reason, realized_pnl_usd, trade_id),
         )
         await conn.commit()
+
+    async def get_trade(self, trade_id: int) -> Optional[dict[str, Any]]:
+        conn = self._require_conn()
+        cur = await conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def set_trade_excursion(self, trade_id: int, mfe_pct: float, mae_pct: float) -> None:
+        """Persist the tracked max favorable / adverse excursion at trade close."""
+        conn = self._require_conn()
+        await conn.execute(
+            "UPDATE trades SET mfe_pct = ?, mae_pct = ? WHERE id = ?",
+            (mfe_pct, mae_pct, trade_id),
+        )
+        await conn.commit()
+
+    async def insert_exit_probe(
+        self,
+        trade_id: int,
+        sample_label: str,
+        quote_price: float,
+        entry_price: float,
+        outcome: Optional[str] = None,
+    ) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            "INSERT INTO exit_probes (trade_id, ts, sample_label, quote_price, entry_price, outcome) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (trade_id, time.time(), sample_label, quote_price, entry_price, outcome),
+        )
+        await conn.commit()
+
+    async def get_exit_probes(self, trade_id: Optional[int] = None) -> list[dict[str, Any]]:
+        conn = self._require_conn()
+        if trade_id is not None:
+            cur = await conn.execute(
+                "SELECT * FROM exit_probes WHERE trade_id = ? ORDER BY ts", (trade_id,)
+            )
+        else:
+            cur = await conn.execute("SELECT * FROM exit_probes ORDER BY trade_id, ts")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def get_open_trades(self, mode: Optional[str] = None) -> list[dict[str, Any]]:
         conn = self._require_conn()

@@ -569,6 +569,93 @@ async def test_reprice_exit_requires_fee_clearing_gain(app_settings):
         await app.db.close()
 
 
+async def test_mfe_mae_recorded_on_reprice_close(app_settings):
+    """
+    Measurement layer: the bot must record each position's max favorable /
+    adverse excursion (relative to entry) and persist it at close. This is
+    the data that later answers "how much profit was available" and "how
+    deep did the dip get" for every trade, win or loss.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        entry = fill.avg_price
+
+        # Dip first: the position goes underwater (MAE). No exit fires —
+        # reversal is blocked by the 60s min-hold, REPRICE needs a gain.
+        dip = make_book(market.token_id_yes, 0.45, 0.47)
+        app.feed.books[market.token_id_yes] = dip
+        await app._check_early_exits(equity=1000)
+        assert len(await app.db.get_open_trades(mode="PAPER")) == 1
+
+        # Then rally past +10% (MFE) -> REPRICE closes the position.
+        rally = make_book(market.token_id_yes, 0.62, 0.64)
+        app.feed.books[market.token_id_yes] = rally
+        await app._check_early_exits(equity=1000)
+
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "REPRICE"
+        assert closed[0]["mfe_pct"] is not None and closed[0]["mae_pct"] is not None
+        # Rally bid 0.62 vs entry ~0.51 -> ~+21%; dip bid 0.45 -> ~-12%.
+        assert closed[0]["mfe_pct"] == pytest.approx((0.62 - entry) / entry, abs=0.01)
+        assert closed[0]["mae_pct"] == pytest.approx((0.45 - entry) / entry, abs=0.01)
+    finally:
+        await app.db.close()
+
+
+async def test_exit_probes_recorded_after_early_exit(app_settings):
+    """
+    Measurement layer: after an early exit the bot samples the held token's
+    price at T+5/15/30/60/120s and at settlement, so a future analysis can
+    classify the exit as premature or protective (did the market reprice to
+    a win after we left?).
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        up = make_book(market.token_id_yes, 0.60, 0.62)
+        app.feed.books[market.token_id_yes] = up
+
+        # Force a close through the same path real exits use.
+        await app._try_early_exit(market, fill.trade_id, "MANUAL_EXIT")
+        baseline = await app.db.get_exit_probes(fill.trade_id)
+        assert any(p["sample_label"] == "P_EXIT" for p in baseline)
+        assert baseline[-1]["quote_price"] == pytest.approx(0.60, abs=0.01)  # walked-bid exit
+
+        # Jump the clock past the whole schedule; the market settles NO.
+        trade = await app.db.get_trade(fill.trade_id)
+        app.feed.outcomes[market.market_id] = "NO"
+        await app._exit_probe_pass(now=trade["exit_ts"] + 130.0)
+
+        probes = await app.db.get_exit_probes(fill.trade_id)
+        labels = {p["sample_label"] for p in probes}
+        assert {"P_5S", "P_15S", "P_30S", "P_60S", "P_120S", "P_SETTLED"} <= labels
+        settled = next(p for p in probes if p["sample_label"] == "P_SETTLED")
+        # Held YES, market settled NO -> the held token is worth 0.
+        assert settled["quote_price"] == 0.0
+        assert settled["outcome"] == "NO"
+        assert app._probe_queue == []  # job dropped once settled
+    finally:
+        await app.db.close()
+
+
 async def test_reprice_exit_does_not_fire_on_phantom_mid_gain(app_settings):
     """
     Regression for the phantom-gain bug: the exit DECISION used book.mid

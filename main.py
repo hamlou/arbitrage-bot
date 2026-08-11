@@ -47,6 +47,13 @@ logger = logging.getLogger("main")
 
 POLL_INTERVAL_S = 1.0
 SETTLEMENT_POLL_INTERVAL_S = 5.0   # resolution doesn't need to be checked as often as signals are evaluated
+# Post-exit probe schedule (MEASUREMENT ONLY, added 2026-08-11 — never gates
+# anything): after an early exit, sample the held token's price at these
+# offsets, plus at settlement. This is the premature-exit detector — did the
+# market reprice to a win AFTER we left? Consumed by scripts/analyze_exits.py.
+EXIT_PROBE_SCHEDULE = (("P_5S", 5), ("P_15S", 15), ("P_30S", 30), ("P_60S", 60), ("P_120S", 120))
+EXIT_PROBE_SETTLE_AT_S = 130.0    # try settlement after this many seconds
+EXIT_PROBE_MAX_WAIT_S = 400.0     # give up on a probe job after this (no outcome found)
 MAX_CONCURRENT_MARKET_EVALS = 10   # cap concurrency to stay within CLOB rate limits
 
 
@@ -122,6 +129,14 @@ class TradingApp:
             controls=self,  # TradingApp implements set_paused/is_paused/set_muted/is_muted
         )
         self._started_at = time.time()
+        # Exit-excursion + post-exit probes (measurement only — see
+        # _exit_probe_loop and scripts/analyze_exits.py): MFE/MAE track the
+        # best/worst executable price each position reached while open; the
+        # probe queue samples the held token after an early exit to detect
+        # premature cuts. None of this ever gates a trade.
+        self._mfe: dict[int, float] = {}
+        self._mae: dict[int, float] = {}
+        self._probe_queue: list[dict] = []
         # Telegram control state: /pause and /resume flip this; when paused the
         # trading cycle stops OPENING new positions but keeps managing existing
         # ones (early exits + settlement still run). In-memory only — a restart
@@ -508,6 +523,12 @@ class TradingApp:
                 if market.resolved:
                     pnl = await self.broker.settle_position(market)
                     if pnl is not None:
+                        # Persist tracked excursions for whatever just settled.
+                        for t in [t for t in open_trades if t["market_id"] == market_id]:
+                            mfe = self._mfe.pop(t["id"], None)
+                            mae = self._mae.pop(t["id"], None)
+                            if mfe is not None and mae is not None:
+                                await self.db.set_trade_excursion(t["id"], mfe, mae)
                         await self.alerter.send_alert(
                             f"[{self.broker.mode}] Settled {market_id}: PnL ${pnl:.2f}",
                             level=AlertLevel.INFO,
@@ -1072,6 +1093,13 @@ class TradingApp:
             if filled_shares < shares - 1e-9:
                 continue  # thin book — no honest exit exists at this price
             unrealized_pct = (exit_price - entry_price) / entry_price
+            # Excursion tracking (measurement only): record the best and worst
+            # executable price this position has reached while open, so every
+            # trade — win or loss — later answers "how much profit was
+            # available" (MFE) and "how deep did it dip" (MAE). Persisted at
+            # close by _try_early_exit / _settle_paper_positions.
+            self._mfe[t["id"]] = max(self._mfe.get(t["id"], unrealized_pct), unrealized_pct)
+            self._mae[t["id"]] = min(self._mae.get(t["id"], unrealized_pct), unrealized_pct)
 
             # Round-trip protocol (the missing piece — see the AdiiX article
             # and REPRICE_EXIT_* settings): while the position is still inside
@@ -1133,14 +1161,110 @@ class TradingApp:
 
     async def _try_early_exit(self, market: Market, trade_id: int, reason: str) -> None:
         try:
+            # Persist the tracked excursions now — the position is closing and
+            # will no longer be monitored.
+            mfe = self._mfe.pop(trade_id, None)
+            mae = self._mae.pop(trade_id, None)
+            if mfe is not None and mae is not None:
+                await self.db.set_trade_excursion(trade_id, mfe, mae)
             pnl = await self.broker.close_position_early(market, trade_id, reason=reason)
             if pnl is not None:
+                # Arm post-exit sampling: did the market keep converging (or
+                # reverse) after we left? P_EXIT is the baseline sample; the
+                # rest come from _exit_probe_loop. Measurement only.
+                try:
+                    trade = await self.db.get_trade(trade_id)
+                    if trade and trade.get("side") and trade.get("entry_price"):
+                        token_id = market.token_id_yes if trade["side"] == "YES" else market.token_id_no
+                        await self.db.insert_exit_probe(
+                            trade_id, "P_EXIT", trade["exit_price"], trade["entry_price"],
+                        )
+                        self._probe_queue.append({
+                            "trade_id": trade_id,
+                            "market_id": market.market_id,
+                            "token_id": token_id,
+                            "entry_price": trade["entry_price"],
+                            "side": trade["side"],
+                            "close_ts": trade["exit_ts"],
+                            "done": set(),
+                        })
+                except Exception:
+                    logger.exception("Failed to arm exit probes for trade %d", trade_id)
                 await self.alerter.send_alert(
                     f"[{self.broker.mode}] Early exit ({reason}) {market.market_id}: PnL ${pnl:.2f}",
                     level=AlertLevel.INFO,
                 )
         except Exception:
             logger.exception("Early exit failed for market %s trade %d", market.market_id, trade_id)
+
+    # -- Exit probes (measurement only) -------------------------------------
+
+    async def _exit_probe_loop(self) -> None:
+        """Sample the held token's price at EXIT_PROBE_SCHEDULE offsets after
+        every early exit, plus the settlement outcome. Pure analytics — never
+        gates anything, so it stays compatible with the run freeze."""
+        while not self._shutdown.is_set():
+            try:
+                await self._exit_probe_pass()
+            except Exception:
+                logger.exception("Exit probe pass failed")
+            await asyncio.sleep(2.0)
+
+    async def _exit_probe_pass(self, now: Optional[float] = None) -> None:
+        """One sampling pass over the probe queue. Extracted from the loop so
+        tests can drive it directly with a fake clock."""
+        now = time.time() if now is None else now
+        remaining: list[dict] = []
+        for job in self._probe_queue:
+            elapsed = now - job["close_ts"]
+            if elapsed < 0:
+                remaining.append(job)
+                continue
+            for label, at_s in EXIT_PROBE_SCHEDULE:
+                if label in job["done"] or elapsed < at_s:
+                    continue
+                try:
+                    quote = await self._probe_token_mid(job["market_id"], job["token_id"])
+                    if quote is not None:
+                        await self.db.insert_exit_probe(job["trade_id"], label, quote, job["entry_price"])
+                        job["done"].add(label)
+                except Exception:
+                    logger.exception("Exit probe %s failed for trade %d", label, job["trade_id"])
+            # Settlement is the ultimate probe: would the held side have won?
+            if elapsed >= EXIT_PROBE_SETTLE_AT_S and "P_SETTLED" not in job["done"]:
+                outcome = None
+                try:
+                    outcome = await self.feed.get_market_outcome(job["market_id"])
+                except Exception:
+                    outcome = None
+                if outcome is not None:
+                    won = job["side"] == outcome
+                    await self.db.insert_exit_probe(
+                        job["trade_id"], "P_SETTLED", 1.0 if won else 0.0,
+                        job["entry_price"], outcome=outcome,
+                    )
+                    job["done"].add("P_SETTLED")
+            if "P_SETTLED" in job["done"] or elapsed >= EXIT_PROBE_MAX_WAIT_S:
+                continue  # complete — drop the job
+            remaining.append(job)
+        self._probe_queue = remaining
+
+    async def _probe_token_mid(self, market_id: str, token_id: str) -> Optional[float]:
+        """Mid of the held token, preferring the zero-latency WS cache."""
+        try:
+            if self.ws_feed.is_fresh(token_id):
+                book = self.ws_feed.get_cached_book(token_id)
+                if book is not None and book.best_bid is not None and book.best_ask is not None:
+                    return (book.best_bid + book.best_ask) / 2.0
+        except Exception:
+            pass
+        try:
+            book = await self.feed.get_order_book(market_id, token_id)
+        except Exception:
+            return None
+        if book is None or book.best_bid is None or book.best_ask is None:
+            return None
+        return (book.best_bid + book.best_ask) / 2.0
 
     async def _refresh_dashboard_state(self) -> None:
         """
@@ -1611,6 +1735,7 @@ class TradingApp:
             ),
             asyncio.create_task(self._command_center_state_loop(), name="command_center_state"),
             asyncio.create_task(self._lag_tracker_loop(), name="lag_tracker"),
+            asyncio.create_task(self._exit_probe_loop(), name="exit_probes"),
         ]
         if self.telegram_reporter.enabled:
             tasks.append(asyncio.create_task(self._telegram_status_loop(), name="telegram_status"))
