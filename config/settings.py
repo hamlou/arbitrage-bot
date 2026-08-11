@@ -177,6 +177,16 @@ class Settings(BaseSettings):
     # the position's original side by more than this — i.e. our own model no
     # longer agrees with the trade we're holding.
     EDGE_REVERSAL_EXIT_THRESHOLD_PCT: float = 0.10
+    # Do not let EDGE_REVERSAL fire within this many seconds of entry. The
+    # reprice the strategy banks on takes time to develop (live 2026-08-10:
+    # median reprice win hold = 30s), and the model is least reliable in the
+    # seconds right after it just told us to buy — live reversals fired 1-45s
+    # after entry, several of them selling positions that then repriced to a
+    # win (winners dip BELOW entry before converging — the same mechanism
+    # that makes stop-losses destroy this strategy). A reversal before the
+    # market has had a chance to converge is the model contradicting its own
+    # fresh entry, not a real edge flip.
+    EDGE_REVERSAL_MIN_HOLD_S: float = 60.0
 
     # --- Round-trip protocol (exit on reprice — the 98%-win-rate piece) ----
     # The strategy's high win rate does NOT come from prediction. It comes

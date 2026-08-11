@@ -853,6 +853,13 @@ class TradingApp:
                         # is only ever set on the fast path, and only for
                         # PaperBroker (LiveBroker gets book_source_arg=None).
                         kwargs["strategy"] = "latency_arb_fast"
+                    # Cap the ACTUAL fill price, not just the decision-time
+                    # ask: on thin 5-min books the ask can jump under the cap
+                    # -> 0.99 between decision and fill (two -$65 losses live
+                    # 2026-08-11). Only PaperBroker takes this kwarg
+                    # (LiveBroker.place_order fills against the real CLOB).
+                    if isinstance(self.broker, PaperBroker):
+                        kwargs["max_entry_price"] = settings.MAX_DIRECTIONAL_ENTRY_PRICE
                     fill = await self.broker.place_order(market, signal.side, size_usd, **kwargs)
                     cycle.mark_order_submitted()
                     await self.alerter.send_alert(
@@ -1098,7 +1105,14 @@ class TradingApp:
                 continue
 
             if (
-                current_signal.side
+                # Min-hold: the model just told us to buy this position; a
+                # flip within seconds of entry is its own fresh read
+                # contradicting itself, before the market has had time to
+                # converge (median reprice hold ~30s live). Live reversals
+                # fired 1-45s after entry sold positions that then repriced
+                # to wins — see EDGE_REVERSAL_MIN_HOLD_S.
+                held_s >= settings.EDGE_REVERSAL_MIN_HOLD_S
+                and current_signal.side
                 and current_signal.side != t["side"]
                 and current_signal.edge_pct >= settings.EDGE_REVERSAL_EXIT_THRESHOLD_PCT
             ):

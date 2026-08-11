@@ -7,7 +7,13 @@ close_position_early(), and min-order-size/tick-size enforcement.
 import pytest
 
 from data.polymarket_feed import Market, OrderBook, OrderBookLevel
-from engine.broker_paper import InsufficientBalanceError, OrderTooSmallError, PaperBroker, SumToOneEdgeLostError
+from engine.broker_paper import (
+    EntryPriceExceededError,
+    InsufficientBalanceError,
+    OrderTooSmallError,
+    PaperBroker,
+    SumToOneEdgeLostError,
+)
 from engine.sum_to_one import find_sum_to_one_opportunity
 from storage.db import Database
 
@@ -72,6 +78,51 @@ async def db(tmp_path):
     await database.connect()
     yield database
     await database.close()
+
+
+# -- entry-price cap on the real fill ----------------------------------------
+
+async def test_place_order_refuses_fill_above_max_entry_price(db):
+    """
+    Regression test for the 2026-08-11 live losses: two directional entries
+    were decided at best_ask 0.20/0.49 (under the 0.70 cap) but filled at
+    0.99 (slippage 407%/104%) after the book moved during the fill latency,
+    and settled at 0 — −$130 of losses from a price the decision-time gate
+    never saw. The signal engine caps the DECISION ask; the broker must also
+    refuse the ACTUAL walked fill price when it exceeds the cap, before any
+    balance is debited.
+    """
+    good = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.49),
+            "tok_no": make_symmetric_book("tok_no", best_ask=0.51)}
+    # Book moves before the fill lands: the ask jumps from 0.49 to 0.99.
+    bad = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.99),
+           "tok_no": make_symmetric_book("tok_no", best_ask=0.51)}
+    feed = MovingFeed(good, bad, good_for_first_n=1)  # decision=good, fill=bad
+    market = make_market()
+    broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
+                         simulated_fill_latency_s=0.3)
+
+    with pytest.raises(EntryPriceExceededError):
+        await broker.place_order(market, "YES", 100, max_entry_price=0.70)
+
+    # Nothing opened, nothing debited.
+    assert not broker.has_open_position("m1")
+    assert broker.balance_usd == pytest.approx(1000)
+    assert await db.get_open_trades(mode="PAPER") == []
+
+
+async def test_place_order_accepts_fill_at_or_below_max_entry_price(db):
+    """The cap must NOT block legitimate fills: a fill that stays under the
+    cap goes through exactly as before."""
+    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.55),
+             "tok_no": make_symmetric_book("tok_no", best_ask=0.55)}
+    market = make_market()
+    broker = PaperBroker(db=db, feed=FakeFeed(books), starting_balance_usd=1000, fee_pct=0.0,
+                         simulated_fill_latency_s=0.3)
+
+    fill = await broker.place_order(market, "YES", 100, max_entry_price=0.70)
+    assert fill.avg_price <= 0.70
+    assert broker.has_open_position("m1")
 
 
 # -- restart recovery ---------------------------------------------------------

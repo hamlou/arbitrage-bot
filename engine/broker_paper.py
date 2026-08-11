@@ -47,6 +47,21 @@ class OrderTooSmallError(Exception):
     pass
 
 
+class EntryPriceExceededError(Exception):
+    """
+    Raised by place_order when the ACTUAL walked fill price exceeds
+    max_entry_price. The signal engine caps entry price at decision time
+    (target_book.best_ask > MAX_DIRECTIONAL_ENTRY_PRICE), but the fill lands
+    after the simulated fill latency against a book that keeps moving, and
+    the walk pays the average across all consumed levels — on the thin books
+    of 5-min crypto markets the ask can jump 0.20 -> 0.99 in the gap. Live
+    2026-08-11: two directional entries decided at best_ask 0.20/0.49 filled
+    at 0.99 (slippage 407%/104%) and settled at 0.0 — -$130 of losses from a
+    price the decision-time gate never saw. Refuse the fill rather than open
+    a position at a price the strategy never approved.
+    """
+
+
 class SumToOneEdgeLostError(Exception):
     """
     Raised by place_sum_to_one_order when the combined fill price of the two
@@ -262,6 +277,7 @@ class PaperBroker:
         strategy: str = "latency_arb",
         combo_group_id: Optional[str] = None,
         book_source: Optional[object] = None,
+        max_entry_price: Optional[float] = None,
     ) -> Fill:
         """
         side: "YES" or "NO". Walks the real live order book for the
@@ -310,6 +326,20 @@ class PaperBroker:
 
         avg_price, shares = self._walk_book_for_fill(book, size_usd)
         avg_price = _round_to_tick(avg_price, self.tick_size)
+        # Entry-price cap on the ACTUAL fill, not just the decision-time
+        # best ask. The signal engine rejects when best_ask > cap, but the
+        # fill walks the book after simulated latency and pays the average —
+        # on thin 5-min books the ask can move from under the cap to 0.99
+        # between decision and fill (live 2026-08-11: two entries decided at
+        # 0.20/0.49 filled at 0.99 and settled at 0). Opening at a price the
+        # strategy never approved turns a capped-away bad trade into a
+        # realized near-total loss.
+        if max_entry_price is not None and avg_price > max_entry_price:
+            raise EntryPriceExceededError(
+                f"Refused fill at avg ${avg_price:.3f} > max entry "
+                f"${max_entry_price:.2f} (decision ask was "
+                f"{decision_ask}, book moved during fill latency)"
+            )
         # Price-dependent taker fee. Polymarket's formula is per SHARE
         # (rate * p * (1 - p)); as a fraction of what we SPEND that is
         # rate * (1 - p) — ~3.5% of notional at p=0.50, less at higher

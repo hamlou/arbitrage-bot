@@ -443,6 +443,53 @@ async def test_early_exit_skips_sum_to_one_legs(app_settings):
         await app.db.close()
 
 
+async def test_edge_reversal_respects_min_hold(app_settings):
+    """
+    Regression for the 2026-08-10 live losses: EDGE_REVERSAL fired 1-45s
+    after entry (median reprice win hold ~30s) — the model flipping its read
+    seconds after it told us to buy is its own fresh entry contradicting
+    itself, before the market has had time to converge. Winners dip BELOW
+    entry before repricing, so those early reversals sold exactly the trades
+    that were about to win (-$305 of reversal losses over 11 trades). The
+    reversal must not fire within EDGE_REVERSAL_MIN_HOLD_S of entry.
+    """
+    app = await build_app(app_settings)
+    try:
+        now = time.time()
+        # Feed a strong DOWN move so the model reads NO with a big edge.
+        for i, price in enumerate([65000, 64800, 64600, 64400, 64200, 64000, 63800, 63600, 63400, 63200]):
+            app.signal_engine.ingest_price_update(
+                PriceUpdate(symbol="BTCUSDT", price=price, event_time_ms=0, received_at=now + i, kind="trade")
+            )
+
+        market = make_market(reference_price=65000)
+        yes_book = make_book(market.token_id_yes, 0.60, 0.62)  # YES priced high
+        no_book = make_book(market.token_id_no, 0.38, 0.40)
+        app.feed.register(market, yes_book, no_book)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        # The model reads NO vs the held YES with a big edge — but the entry
+        # is fresh (held_s < EDGE_REVERSAL_MIN_HOLD_S), so the reversal must
+        # NOT fire yet.
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 1  # still held despite the model flip
+
+        # Now age the position beyond the min-hold and re-check: the same
+        # model read must now be allowed to reverse it.
+        await app.db._conn.execute(
+            "UPDATE trades SET entry_ts = ? WHERE id = ?",
+            (now - 120, fill.trade_id),
+        )
+        await app._check_early_exits(equity=1000)
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "EDGE_REVERSAL"
+    finally:
+        await app.db.close()
+
+
 async def test_reprice_exit_banks_convergence(app_settings):
     """
     Round-trip protocol (the strategy's high-win-rate piece): a directional
