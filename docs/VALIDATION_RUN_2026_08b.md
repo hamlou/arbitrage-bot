@@ -185,6 +185,34 @@ new network integrations (a Binance @depth subscription, futures endpoints,
 Deribit) and are a larger build — worth doing as one focused, tested push
 after this one settles, still measurement-only.
 
+### 2026-08-12 — Executable-profit forensics (measurement-only, per external
+review "distinguish theoretical repricing from executable profit")
+
+The lag strategy's premise is "Polymarket eventually follows Binance" — but
+"the market moved the right way" ≠ "we could have made money" (the book can
+reprice before our order lands, fills slip, fees eat the edge). This batch
+builds the instrument that measures that gap, changes NO thresholds:
+
+1. **`scripts/executable_forensics.py`** (new): per closed directional trade,
+   joins the decision signal (edge + `poly_book_age_s`), the entry-latency
+   row (`tick_to_order_ms`), fill slippage, fees, exit reason, and net PnL;
+   reports win rate, EDGE DECAY (avg decision edge − avg net return), median
+   tick→order vs the ~2s window, avg book age at decision, and per-reason
+   net PnL. Sparse-DB safe (missing joins tolerated). Run manually like
+   `analyze_exits.py`; both import the shared classification module.
+2. **`classify_early_exits` now covers GAP_EXPIRED** (`engine/exit_forensics
+   .py`, exit_reasons parameterized, default EDGE_REVERSAL unchanged): the
+   digest and the new script both split GAP_EXPIRED exits into premature /
+   protective from exit_probes — the selection-bias check the review asked
+   for (GAP_EXPIRED is built on the median of REPRICE WINNERS; is it cutting
+   losers or also slow winners?).
+3. **Digest sections** (`alerts/status_report.py`): GAP_EXPIRED premature/
+   protective breakdown + per-asset GAP MEASUREMENT (median lag ms, reprice
+   rate, direction accuracy) now render in the daily Telegram digest.
+
+Freeze status: unchanged. All additions; `settings.py` diff is pure additions
+(zero deletions) — no frozen threshold was touched. 474 tests pass.
+
 ---
 
 *Continue logging every intervention below — a run with a documented human

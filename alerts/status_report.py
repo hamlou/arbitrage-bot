@@ -444,6 +444,18 @@ def format_forensics_digest(summary: dict) -> str:
         f"  Distinct days: {distinct} / {summary.get('live_min_distinct_days', 5)}",
     ]
 
+    gap = summary.get("gap_expired") or {}
+    if gap.get("n"):
+        lines += [
+            "",
+            "GAP_EXPIRED exits (held past the measured median reprice):",
+            f"  PREMATURE (repriced to target after we left):  {gap.get('premature_n', 0)}",
+            f"  Held side WON at settlement:                    {gap.get('held_won_n', 0)}",
+            f"  Protective (kept falling):                      {gap.get('protective_n', 0)}",
+            f"  No probe data yet:                              {gap.get('no_data_n', 0)}",
+            f"  Net PnL of GAP_EXPIRED exits:                   {_fmt_money(gap.get('net_pnl_usd'), signed=True)}",
+        ]
+
     lag = summary.get("lag_stats") or {}
     if lag:
         lines += ["", "GAP MEASUREMENT (lag_events, per asset):"]

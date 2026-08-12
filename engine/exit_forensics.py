@@ -29,9 +29,12 @@ def classify_early_exits(
     closed_trades: list[dict[str, Any]],
     probes: list[dict[str, Any]],
     reprice_target: float,
+    exit_reasons: tuple[str, ...] = ("EDGE_REVERSAL",),
 ) -> dict[str, Any]:
     """
-    Classify every EDGE_REVERSAL exit as premature / held-won / protective.
+    Classify early exits (default EDGE_REVERSAL; GAP_EXPIRED added 2026-08-12)
+    as premature / held-won / protective — the same question answered for the
+    gap-timed exit: did the market reprice to a win AFTER we left?
 
     Returns a dict with the four buckets, each a list of (trade, max_recovery,
     settled_probe_or_None) tuples, plus the underlying inputs.
@@ -40,7 +43,7 @@ def classify_early_exits(
     for p in probes:
         by_trade[p["trade_id"]].append(p)
 
-    reversals = [t for t in closed_trades if t.get("exit_reason") == "EDGE_REVERSAL"]
+    reversals = [t for t in closed_trades if t.get("exit_reason") in exit_reasons]
     premature: list = []
     held_won: list = []
     protective: list = []
@@ -120,7 +123,10 @@ def build_digest_summary(
     renders; never raises on weird rows (missing keys are tolerated).
     """
     closed = [t for t in all_trades if t.get("status") == "CLOSED"]
-    classification = classify_early_exits(closed, probes, reprice_target)
+    classification = classify_early_exits(
+        closed, probes, reprice_target,
+        exit_reasons=("EDGE_REVERSAL", "GAP_EXPIRED"),
+    )
 
     # Days elapsed + distinct trading days: same logic validate_paper_run.py
     # uses, kept inline so the digest and the gate agree by construction.
@@ -144,6 +150,22 @@ def build_digest_summary(
     for t in closed:
         by_reason[t.get("exit_reason") or "?"] += t.get("realized_pnl_usd") or 0.0
 
+    # GAP_EXPIRED breakdown (added 2026-08-12, selection-bias validation):
+    # the gap exit fires based on the median of REPRICE WINNERS — was it
+    # cutting losers (protective) or also cutting winners that were just slow
+    # (premature)? Answered from the probe data, not argued.
+    gap_exits = [t for t in closed if t.get("exit_reason") == "GAP_EXPIRED"]
+    def _bucket_n(bucket):
+        return sum(1 for t, _, _ in bucket if t.get("exit_reason") == "GAP_EXPIRED")
+    gap_expired = {
+        "n": len(gap_exits),
+        "premature_n": _bucket_n(classification["premature"]),
+        "held_won_n": _bucket_n(classification["held_won"]),
+        "protective_n": _bucket_n(classification["protective"]),
+        "no_data_n": _bucket_n(classification["no_data"]),
+        "net_pnl_usd": sum((t.get("realized_pnl_usd") or 0) for t in gap_exits),
+    }
+
     return {
         "closed_trades": len(closed),
         "days_elapsed": days_elapsed,
@@ -163,4 +185,5 @@ def build_digest_summary(
         "live_min_days": live_min_days,
         "live_min_distinct_days": live_min_distinct_days,
         "lag_stats": _lag_stats(lag_events or []),
+        "gap_expired": gap_expired,
     }
