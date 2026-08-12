@@ -148,25 +148,76 @@ async def test_discover_active_markets_uses_keyset_endpoint_with_updown_tag():
     endpoint is deprecated/sunset (API returns `sunset: Fri, 01 May 2026` +
     `warning: use /markets/keyset`) and serves stale Dec-2025 ghost rows, so
     the bot found zero markets and could never trade. Discovery must use
-    /events/keyset with tag_slug=up-or-down, ordered endDate-ascending so the
-    soonest-ending (currently live) windows come first.
+    /events/keyset with tag_slug=up-or-down.
+
+    Regression guard for the 2026-08-12 live-data bug: with the old
+    `order=endDate&ascending=true` params the endpoint served a STALE slice
+    with 0-1 live windows while the same query WITHOUT those params returned
+    18 live windows. The primary (fresh-slice) variant must therefore come
+    FIRST and must NOT carry the order/ascending params.
     """
-    captured = {}
+    captured = []
 
     async def fake_gamma_get(path, params=None):
-        captured["path"] = path
-        captured["params"] = params
+        captured.append((path, params))
         return []
 
     feed = PolymarketFeed(min_liquidity_usd=1)
     feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
     await feed.discover_active_markets()
 
-    assert captured["path"] == "/events/keyset"
-    assert captured["params"]["tag_slug"] == "up-or-down"
-    assert captured["params"]["order"] == "endDate"
-    assert captured["params"]["ascending"] == "true"
-    assert captured["params"]["active"] == "true"
+    first_path, first_params = captured[0]
+    assert first_path == "/events/keyset"
+    assert first_params["tag_slug"] == "up-or-down"
+    assert first_params["active"] == "true"
+    # The fresh-slice variant must NOT request the stale-slice ordering.
+    assert "order" not in first_params
+    assert "ascending" not in first_params
+
+
+async def test_discover_merges_results_from_all_param_variants():
+    """
+    Verified live 2026-08-12: Gamma serves DIFFERENT window sets per param
+    slice — the no-order query returned hourly windows while the
+    order=endDate variant returned the short 5m/15m windows, at the SAME
+    moment. Discovery must MERGE both variants (deduped), not stop at the
+    first non-empty one, or it silently misses whichever slice it skips.
+    """
+    captured = []
+    calls = {"n": 0}
+
+    now = time.time()
+
+    def mk(id, question, liq):
+        return {
+            "id": id,
+            "question": question,
+            "clobTokenIds": [f"t_{id}_yes", f"t_{id}_no"],
+            "liquidity": liq,
+            "endDate": datetime.fromtimestamp(now + 300, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "closed": False,
+        }
+
+    async def fake_gamma_get(path, params=None):
+        captured.append(dict(params or {}))
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First variant (no order): an hourly-style market that the
+            # 5/15-min parser rejects.
+            return {"events": [_keyset_event(mk("888", "Bitcoin Up or Down - August 12, 5AM ET", "12000"), "e1")], "next_cursor": None}
+        # Second variant (order params): the short 5-min window.
+        return {"events": [_keyset_event(mk("777", "Bitcoin Up or Down - August 12, 5:00AM-5:05AM ET", "12000"), "e2")], "next_cursor": None}
+
+    feed = PolymarketFeed(min_liquidity_usd=1_000.0)
+    feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
+    markets = await feed.discover_active_markets()
+
+    # The short window from the SECOND variant survives — merging, not
+    # first-wins, is what makes that possible.
+    assert [m.market_id for m in markets] == ["777"]
+    assert len(captured) == 2
+    assert "order" not in captured[0]
+    assert captured[1]["order"] == "endDate"
 
 
 def _keyset_event(market: dict, event_id: str = "ev1") -> dict:
@@ -328,10 +379,12 @@ async def test_discover_stops_on_repeated_cursor():
     feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
     markets = await feed.discover_active_markets()
 
-    # One request for the initial page; the repeated cursor must stop it.
-    assert len(calls) == 2
-    assert calls == [None, "stuck-cursor"]
-    assert [m.market_id for m in markets] == ["555"]
+    # Discovery now merges TWO param variants, so each does one initial page
+    # plus one repeated-cursor page (4 calls total). Within each variant the
+    # repeated cursor must stop paging immediately.
+    assert len(calls) == 4
+    assert calls == [None, "stuck-cursor", None, "stuck-cursor"]
+    assert [m.market_id for m in markets] == ["555"]  # deduped across variants
 
 
 def test_liquidity_filter_excludes_thin_markets():
@@ -657,9 +710,12 @@ async def test_discover_binary_markets_respects_horizon_and_pages():
     def iso(offset_s: float) -> str:
         return datetime.fromtimestamp(now + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    captured = {}
-    pages = iter([
-        {
+    captured = []
+
+    def page_payload():
+        # Same page for every call — discovery now queries TWO param variants,
+        # so a one-shot iterator would be exhausted on the second variant.
+        return {
             "events": [
                 _keyset_event({
                     "id": "a1", "question": "Q1",
@@ -672,14 +728,12 @@ async def test_discover_binary_markets_respects_horizon_and_pages():
                     "endDate": iso(3 * 86400), "closed": False,  # ends in 3 days
                 }, "eb"),
             ],
-            "next_cursor": "cursor-1",
-        },
-        {"events": [], "next_cursor": None},
-    ])
+            "next_cursor": None,
+        }
 
     async def fake_gamma_get(path, params=None):
-        captured["params"] = params
-        return next(pages)
+        captured.append(dict(params or {}))
+        return page_payload()
 
     feed = PolymarketFeed(min_liquidity_usd=1_000.0)
     feed._gamma_get = fake_gamma_get  # type: ignore[method-assign]
@@ -687,5 +741,7 @@ async def test_discover_binary_markets_respects_horizon_and_pages():
         min_liquidity_usd=500.0, lookahead_s=24 * 3600, max_pages=2,
     )
 
-    assert "tag_slug" not in captured["params"]
+    # Both variants must be tag-free (the whole point of the wider scan).
+    for p in captured:
+        assert "tag_slug" not in p
     assert [m.market_id for m in markets] == ["a1"]  # 3-day market outside 24h horizon

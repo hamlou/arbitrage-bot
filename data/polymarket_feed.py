@@ -53,6 +53,22 @@ DISCOVERY_LOOKAHEAD_S = 45 * 60
 # live windows on ghost-first responses, so the bot found zero markets. 15
 # pages x 200 = 3,000 events clears the ghost crowd with comfortable margin.
 MAX_DISCOVERY_PAGES = 15
+# Verified live 2026-08-12: /events/keyset serves DIFFERENT cached slices
+# depending on the exact query params. With `order=endDate&ascending=true`
+# (the old params) the endpoint returned a STALE slice with 0-1 live BTC/ETH
+# windows while the SAME query WITHOUT those params returned 18 live windows
+# with real liquidity. The API was never fully "down" — the params were
+# selecting a stale cache slice, and the bot's discovery-dry alert fired
+# while live windows were a different query away. Discovery now tries the
+# fresh-slice variant FIRST and only falls back to the older param set when
+# the first yields zero markets; it reports empty only if ALL variants fail.
+_DISCOVERY_PARAM_VARIANTS: tuple[dict[str, str], ...] = (
+    {"limit": "200", "active": "true", "closed": "false", "tag_slug": "up-or-down"},
+    {
+        "limit": "200", "active": "true", "closed": "false", "tag_slug": "up-or-down",
+        "order": "endDate", "ascending": "true",
+    },
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,50 +196,19 @@ class PolymarketFeed:
         resp.raise_for_status()
         return resp.json()
 
-    async def discover_active_markets(self) -> list[Market]:
+    async def _page_events_keyset(
+        self, base_params: dict[str, Any], horizon_max: float, max_pages: int = MAX_DISCOVERY_PAGES,
+    ) -> list[dict]:
         """
-        Pull the currently-trading (and soon-expiring) BTC/ETH 5-minute and
-        15-minute up/down markets from Gamma's /events/keyset endpoint,
-        filtered to those meeting min_liquidity_usd.
-
-        Why /events/keyset and NOT /markets? Verified live 2026-08-04: the
-        old /markets list endpoint is deprecated/sunset — the API returns
-        `deprecation: true`, `sunset: Fri, 01 May 2026`, and a warning header
-        `299 - "use /markets/keyset"` — and now serves stale cached rows
-        (Dec-2025 up/down markets still marked active with $0 liquidity), so
-        any query against it returns zero real candidates. /events/keyset
-        with tag_slug=up-or-down returns the actual current windows (verified
-        live: "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET" appears
-        there, ordered by endDate ascending, soonest first).
-
-        The up-or-down tag covers every duration (5m/15m/1h/4h/daily...), so
-        on top of the parser we additionally require:
-          - the window to be live or about to start: endDate within
-            [now - 2 min, now + DISCOVERY_LOOKAHEAD_S]. A pre-created window
-            ending tomorrow is a real market but has no tradeable book and no
-            short-horizon edge — subscribing to it only wastes the slot.
-          - liquidity_usd >= min_liquidity_usd (keeps BTC/ETH, drops thin
-            altcoin windows).
+        Page through /events/keyset with the given base params until the
+        stuck-cursor guard, the page cap, or the horizon early-stop fires.
+        Returns the raw collected events.
         """
-        now = time.time()
-        horizon_max = now + DISCOVERY_LOOKAHEAD_S
-        # Page through the keyset cursor. Ordering is endDate-ascending, so
-        # once a page's soonest event ends beyond the lookahead horizon, every
-        # later page does too — stop there. The page cap is pure insurance
-        # against a pathological response; in practice 1-2 pages cover the
-        # live windows.
         events: list[dict] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        for _ in range(MAX_DISCOVERY_PAGES):
-            params: dict[str, Any] = {
-                "limit": 200,
-                "active": "true",
-                "closed": "false",
-                "tag_slug": "up-or-down",
-                "order": "endDate",
-                "ascending": "true",
-            }
+        for _ in range(max_pages):
+            params = dict(base_params)
             if cursor:
                 params["cursor"] = cursor
             raw = await self._gamma_get("/events/keyset", params=params)
@@ -252,9 +237,46 @@ class PolymarketFeed:
             )
             if soonest_end is not None and soonest_end > horizon_max:
                 break
+        return events
 
+    async def discover_active_markets(self) -> list[Market]:
+        """
+        Pull the currently-trading (and soon-expiring) BTC/ETH 5-minute and
+        15-minute up/down markets from Gamma's /events/keyset endpoint,
+        filtered to those meeting min_liquidity_usd.
+
+        Why /events/keyset and NOT /markets? Verified live 2026-08-04: the
+        old /markets list endpoint is deprecated/sunset — the API returns
+        `deprecation: true`, `sunset: Fri, 01 May 2026`, and a warning header
+        `299 - "use /markets/keyset"` — and now serves stale cached rows
+        (Dec-2025 up/down markets still marked active with $0 liquidity), so
+        any query against it returns zero real candidates. /events/keyset
+        with tag_slug=up-or-down returns the actual current windows (verified
+        live: "Bitcoin Up or Down - August 4, 7:05AM-7:10AM ET" appears
+        there, ordered by endDate ascending, soonest first).
+
+        The up-or-down tag covers every duration (5m/15m/1h/4h/daily...), so
+        on top of the parser we additionally require:
+          - the window to be live or about to start: endDate within
+            [now - 2 min, now + DISCOVERY_LOOKAHEAD_S]. A pre-created window
+            ending tomorrow is a real market but has no tradeable book and no
+            short-horizon edge — subscribing to it only wastes the slot.
+          - liquidity_usd >= min_liquidity_usd (keeps BTC/ETH, drops thin
+            altcoin windows).
+        """
+        now = time.time()
+        horizon_max = now + DISCOVERY_LOOKAHEAD_S
+        # MERGE all param variants, don't stop at the first non-empty: verified
+        # live 2026-08-12 that Gamma serves DIFFERENT window sets per param
+        # slice — the no-order query returned the hourly windows while the
+        # order=endDate variant returned the short 5m/15m windows, at the SAME
+        # moment. A first-wins loop would return whichever slice happened to
+        # be non-empty and silently miss the rest.
+        raw_events: list[dict] = []
+        for variant in _DISCOVERY_PARAM_VARIANTS:
+            raw_events.extend(await self._page_events_keyset(dict(variant), horizon_max))
         markets: list[Market] = []
-        for ev in events:
+        for ev in raw_events:
             for m in ev.get("markets") or []:
                 parsed = _parse_gamma_market(m)
                 if parsed is None:
@@ -273,6 +295,12 @@ class PolymarketFeed:
                 continue
             seen.add(m.market_id)
             uniq.append(m)
+        if not uniq:
+            logger.warning(
+                "Discovery: ALL %d param variants returned 0 tradeable markets — "
+                "Gamma genuinely serving a stale/empty slice right now",
+                len(_DISCOVERY_PARAM_VARIANTS),
+            )
         return uniq
 
     async def discover_binary_markets(
@@ -298,39 +326,18 @@ class PolymarketFeed:
         now = time.time()
         horizon_max = now + lookahead_s
 
-        events: list[dict] = []
-        cursor: str | None = None
-        seen_cursors: set[str] = set()
-        for _ in range(max_pages):
-            params: dict[str, Any] = {
-                "limit": 200,
-                "active": "true",
-                "closed": "false",
-                "order": "endDate",
-                "ascending": "true",
-            }
-            if cursor:
-                params["cursor"] = cursor
-            raw = await self._gamma_get("/events/keyset", params=params)
-            page_events = raw.get("events", []) if isinstance(raw, dict) else raw
-            page_events = page_events or []
-            events.extend(page_events)
-            next_cursor = raw.get("next_cursor") if isinstance(raw, dict) else None
-            if not next_cursor:
-                break
-            if next_cursor in seen_cursors:
-                break
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-            soonest_end = min(
-                (ts for ts in (_safe_ts(e.get("endDate")) for e in page_events) if ts is not None),
-                default=None,
-            )
-            if soonest_end is not None and soonest_end > horizon_max:
-                break
-
+        # Same stale-slice protection as discover_active_markets: MERGE both
+        # param variants — Gamma serves different window sets per slice, so a
+        # first-wins loop would silently miss whichever slice it didn't check.
+        variants: tuple[dict[str, str], ...] = (
+            {"limit": "200", "active": "true", "closed": "false"},
+            {"limit": "200", "active": "true", "closed": "false", "order": "endDate", "ascending": "true"},
+        )
+        raw_events: list[dict] = []
+        for variant in variants:
+            raw_events.extend(await self._page_events_keyset(dict(variant), horizon_max, max_pages=max_pages))
         markets: list[Market] = []
-        for ev in events:
+        for ev in raw_events:
             for m in ev.get("markets") or []:
                 parsed = _parse_any_binary_market(m)
                 if parsed is None:
