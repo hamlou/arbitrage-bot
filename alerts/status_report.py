@@ -442,7 +442,26 @@ def format_forensics_digest(summary: dict) -> str:
         f"  Trades: {n} / {summary.get('live_min_trades', 200)}",
         f"  Days:   {days:.1f} / {summary.get('live_min_days', 7.0)}",
         f"  Distinct days: {distinct} / {summary.get('live_min_distinct_days', 5)}",
-        "",
-        "Measurement only — no thresholds changed.",
     ]
+
+    lag = summary.get("lag_stats") or {}
+    if lag:
+        lines += ["", "GAP MEASUREMENT (lag_events, per asset):"]
+        for asset, s in lag.items():
+            lag_ms = s.get("median_lag_ms")
+            lag_str = f"{lag_ms:.0f}ms" if lag_ms is not None else "—"
+            repriced = s.get("repriced_pct")
+            repriced_str = f"{repriced:.0f}%" if repriced is not None else "—"
+            correct = s.get("correct_dir_pct")
+            correct_str = f"{correct:.0f}%" if correct is not None else "—"
+            lines.append(
+                f"  {asset:<4} n={s.get('n', 0):>4}  median lag {lag_str}  "
+                f"repriced {repriced_str}  right direction {correct_str}"
+            )
+        lines.append(
+            "  (direction accuracy is the number that decides whether gap-"
+            "timed ENTRIES are ever safe)"
+        )
+
+    lines += ["", "Measurement only — no thresholds changed."]
     return "\n".join(lines)

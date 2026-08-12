@@ -59,11 +59,13 @@ class MakerOrder:
     maker_side: str       # YES / NO — the CHEAPER leg, resting at the bid
     taker_side: str       # YES / NO — the other leg, taken at market on fill
     maker_price: float    # resting limit price (= best bid at post)
-    half_size_usd: float  # dollar size of EACH leg (pair total = 2 * half)
+    half_size_usd: float  # dollar budget per leg (informational)
+    target_shares: float  # EQUAL share count per leg (equal-share sizing — the
+                          # payout is then identical regardless of outcome)
     reserve_usd: float    # cash reserved at post (pair cost + est. taker fee)
     posted_at: float
     db_row_id: int
-    status: str = "PENDING"  # PENDING / FILLED / REVERSED / CANCELLED
+    status: str = "PENDING"  # PENDING / FILLED / REVERSED / CANCELLED / HELD
 
 
 class InsufficientBalanceError(Exception):
@@ -339,6 +341,46 @@ class PaperBroker:
         avg_price = proceeds / filled_shares if filled_shares > 0 else 0.0
         return avg_price, filled_shares
 
+    def _walk_book_for_shares(self, book: OrderBook, max_shares: float) -> tuple[float, float]:
+        """
+        Simulate a BUY market order for up to `max_shares` SHARES by walking
+        the ask side (equal-share sibling of _walk_book_for_fill, added
+        2026-08-12). Returns (avg_price, shares_filled); raises ValueError if
+        the book can't absorb the full `max_shares`.
+        """
+        remaining = max_shares
+        shares = 0.0
+        cost = 0.0
+        for level in book.asks:
+            take = min(remaining, level.size)
+            shares += take
+            cost += take * level.price
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+        if remaining > 1e-9:
+            raise ValueError(
+                f"Insufficient order-book depth to fill {max_shares:.2f} shares; "
+                f"only {shares:.2f} available"
+            )
+        avg_price = cost / shares if shares > 0 else 0.0
+        return avg_price, shares
+
+    def _max_shares_within_budget(self, book: OrderBook, budget_usd: float) -> float:
+        """Maximum shares buyable on the ask side within `budget_usd` dollars
+        (walking from the best ask). Used to size an equal-share sum-to-one
+        pair: the binding side's capacity caps the whole pair."""
+        shares = 0.0
+        cost = 0.0
+        for level in book.asks:
+            if cost >= budget_usd or level.price <= 0:
+                break
+            take_usd = budget_usd - cost
+            take_shares = min(level.size, take_usd / level.price)
+            shares += take_shares
+            cost += take_shares * level.price
+        return shares
+
     async def place_order(
         self,
         market: Market,
@@ -498,99 +540,126 @@ class PaperBroker:
         book_source: Optional[object] = None,
     ) -> tuple[Fill, Fill]:
         """
-        Buys both YES and NO to lock in a risk-free profit regardless of
-        outcome. combo_group_id links the two legs so settlement and
-        reporting treat them as one position, not two unrelated directional
-        bets.
-
-        Sizing note: splits total_size_usd evenly by DOLLAR amount between
-        the two legs, not by equal SHARE count. True equal-share sizing would
-        require solving jointly against both books' depth; not worth the
-        complexity for what are typically small, short-lived edges. Equal-
-        dollar sizing means a small residual directional exposure can remain
-        when yes_ask != no_ask — real, but usually minor relative to the
-        locked-in edge. Documented here rather than silently assumed away.
+        Buys the SAME NUMBER OF SHARES of YES and NO (equal-SHARE sizing,
+        fixed 2026-08-12) so the payout is identical regardless of outcome —
+        the property that makes sum-to-one actual risk-free arbitrage. The
+        previous equal-DOLLAR sizing ($50 YES @ 0.40 = 125 shares vs $50 NO
+        @ 0.50 = 100 shares) paid $125 if YES won and $100 if NO won — a
+        residual directional bet dressed up as risk-free. Now the share count
+        is the maximum BOTH books' depth supports within the caller's dollar
+        budget, and both legs open at exactly that count.
+        combo_group_id links the pair so settlement and reporting treat them
+        as one position.
         """
         combo_group_id = str(uuid.uuid4())
-        half = total_size_usd / 2
+        half_budget = total_size_usd / 2
+        rate = self._fee_rate_for(opportunity.market)
 
-        # (1) QUOTE the real fills BEFORE opening anything. The opportunity
-        # was detected against best asks (find_sum_to_one_opportunity), but
-        # each leg fills by WALKING the ask side — on a thin book the walked
-        # combined cost can exceed $1 even when the best asks sum below it
-        # (live 2026-08-09: fills at 0.86+0.15=1.01 — a guaranteed loss that
-        # the reversal then amplified to −$46.72). Refuse to place at all
-        # when the real walk no longer locks a profit: never open a
-        # guaranteed-losing combo.
-        quoted = await self._quote_sum_to_one_fills(opportunity.market, half, book_source)
-        if quoted is None:
+        async def _book(token_id: str) -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(opportunity.market.market_id, token_id)
+
+        yes_book = await _book(opportunity.market.token_id_yes)
+        no_book = await _book(opportunity.market.token_id_no)
+
+        # (1) Equal-share capacity: the max shares EACH book absorbs within
+        # its half-budget; the binding (thinner) side caps the whole pair.
+        shares_target = min(
+            self._max_shares_within_budget(yes_book, half_budget),
+            self._max_shares_within_budget(no_book, half_budget),
+        )
+        if shares_target <= 0:
             raise SumToOneEdgeLostError(
                 0.0, 0.0,
-                action="refused before placing — insufficient book depth to fill both legs",
-            )
-        quoted_cost = quoted[0] + quoted[1]
-        quoted_fee_cost = (
-            fees.taker_fee_pct(quoted[0], self._fee_rate_for(opportunity.market))
-            + fees.taker_fee_pct(quoted[1], self._fee_rate_for(opportunity.market))
-        )
-        quoted_edge = (1.0 - quoted_cost) - quoted_fee_cost
-        if quoted_edge <= 0:
-            logger.warning(
-                "Sum-to-one %s refused before placing: walked fills %.3f+%.3f=%.3f "
-                "(edge %.2f%%) — best asks looked under $1 but the real ask-walk does not",
-                opportunity.market.market_id, quoted[0], quoted[1], quoted_cost, quoted_edge * 100,
-            )
-            raise SumToOneEdgeLostError(
-                quoted_cost, quoted_edge,
-                action="refused before placing — the real fill walk exceeds $1",
+                action="refused before placing — no equal-share size both books support",
             )
 
-        # (2) Pre-check the TOTAL cost (both legs + price-dependent fees on
-        # the QUOTED fill prices) BEFORE opening either leg. Two reasons
-        # (reviewed 2026-08-07): (1) with concurrent legs, two per-leg
-        # balance checks could each pass while the combined cost exceeds the
-        # balance — the total must be validated up front; (2) sequentially,
-        # the second leg could raise InsufficientBalanceError after the
-        # first already opened, leaving a HALF-OPEN hedge that the
-        # edge-revalidation below never sees. Each leg is half the size, so
-        # total fee = half*(fee(yes_fill) + fee(no_fill)) at the QUOTED
-        # prices.
-        fee_yes = half * fees.taker_fee_fraction_of_notional(quoted[0], self._fee_rate_for(opportunity.market))
-        fee_no = half * fees.taker_fee_fraction_of_notional(quoted[1], self._fee_rate_for(opportunity.market))
-        total_cost = total_size_usd + fee_yes + fee_no
+        # (2) Quote the REAL equal-share fills before opening anything: the
+        # opportunity was detected against best asks, but each leg fills by
+        # WALKING the ask side — on a thin book the walked combined cost can
+        # exceed $1 even when the best asks sum below it (live 2026-08-09:
+        # fills at 0.86+0.15=1.01). Refuse a combo whose real equal-share
+        # walk no longer locks a profit.
+        try:
+            yes_avg, _ = self._walk_book_for_shares(yes_book, shares_target)
+            no_avg, _ = self._walk_book_for_shares(no_book, shares_target)
+        except ValueError:
+            raise SumToOneEdgeLostError(
+                0.0, 0.0,
+                action="refused before placing — insufficient book depth to fill both legs equally",
+            )
+        per_share_cost = (
+            yes_avg + no_avg
+            + fees.taker_fee_per_share(yes_avg, rate)
+            + fees.taker_fee_per_share(no_avg, rate)
+        )
+        locked_edge_per_share = 1.0 - per_share_cost
+        if locked_edge_per_share <= 0:
+            logger.warning(
+                "Sum-to-one %s refused before placing: equal-share fills %.3f+%.3f=%.3f "
+                "(fees %.3f) — the real walk does not lock a profit",
+                opportunity.market.market_id, yes_avg, no_avg,
+                yes_avg + no_avg, per_share_cost - yes_avg - no_avg,
+            )
+            raise SumToOneEdgeLostError(
+                per_share_cost, locked_edge_per_share,
+                action="refused before placing — the real equal-share walk exceeds $1",
+            )
+
+        # (3) Affordability at the WALKED prices: shrink to the whole shares
+        # the budget supports, or refuse when even one pair can't be
+        # afforded. Validating the TOTAL up front (not per-leg) is what
+        # prevents a half-open hedge (reviewed 2026-08-07).
+        affordable = self.balance_usd / per_share_cost
+        if affordable < 1.0:
+            raise InsufficientBalanceError(
+                f"Balance ${self.balance_usd:.2f} cannot afford one equal-share pair "
+                f"(per-share cost ${per_share_cost:.3f})"
+            )
+        if affordable < shares_target:
+            shares_target = int(affordable)
+            yes_avg, _ = self._walk_book_for_shares(yes_book, shares_target)
+            no_avg, _ = self._walk_book_for_shares(no_book, shares_target)
+            per_share_cost = (
+                yes_avg + no_avg
+                + fees.taker_fee_per_share(yes_avg, rate)
+                + fees.taker_fee_per_share(no_avg, rate)
+            )
+            locked_edge_per_share = 1.0 - per_share_cost
+            if locked_edge_per_share <= 0:
+                raise SumToOneEdgeLostError(
+                    per_share_cost, locked_edge_per_share,
+                    action="refused before placing — shrunk equal-share walk exceeds $1",
+                )
+        total_cost = shares_target * per_share_cost
         if total_cost > self.balance_usd:
             raise InsufficientBalanceError(
                 f"Sum-to-one combo cost incl. fees ${total_cost:.2f} exceeds "
                 f"paper balance ${self.balance_usd:.2f}"
             )
 
-        # Submit BOTH legs concurrently. Sequential submission let the book
-        # move for the full fill latency TWICE between the two halves of the
-        # hedge (each leg pays simulated_fill_latency_s on its own) — fills
-        # landed at 0.31+0.73=1.04 and 0.17+0.89=1.06, the −$45.94 loss.
-        # asyncio.gather overlaps the two latency waits so both legs fill
-        # against a ~simultaneous book. The per-leg balance checks each see
-        # half*(1+fee) <= balance; since the total was pre-validated above,
-        # both debits are safe.
+        # (4) Submit BOTH legs concurrently at exactly `shares_target`
+        # shares. asyncio.gather overlaps the two fill-latency waits so both
+        # legs fill against a ~simultaneous book (the sequential path let the
+        # book move twice between the halves of the hedge — the −$45.94
+        # loss). If one leg fails, reverse the leg that opened so the hedge
+        # is never left half-open.
         results = await asyncio.gather(
-            self.place_order(
-                opportunity.market, "YES", half, strategy="sum_to_one",
-                combo_group_id=combo_group_id, book_source=book_source,
+            self._place_equal_share_leg(
+                opportunity.market, "YES", shares_target, yes_avg,
+                combo_group_id, book_source,
             ),
-            self.place_order(
-                opportunity.market, "NO", half, strategy="sum_to_one",
-                combo_group_id=combo_group_id, book_source=book_source,
+            self._place_equal_share_leg(
+                opportunity.market, "NO", shares_target, no_avg,
+                combo_group_id, book_source,
             ),
             return_exceptions=True,
         )
         failed = [r for r in results if isinstance(r, Exception)]
         if failed:
-            # One leg failed (e.g. insufficient book depth). Reverse the leg
-            # that DID open so the hedge is never left half-open, then
-            # re-raise the original error. close_position_early returns None
-            # (not an exception) when there is no bid depth to sell into —
-            # that escape must be logged loudly, never silent, or a half-open
-            # hedge would persist without a trace.
             for fill in results:
                 if isinstance(fill, Exception):
                     continue
@@ -610,35 +679,72 @@ class PaperBroker:
             raise failed[0]
         yes_fill, no_fill = results  # type: ignore[assignment]
 
-        # Re-validate the locked edge from the ACTUAL fills, not the
-        # decision-time best asks. The opportunity was detected against best
-        # asks, but each leg fills after the simulated fill latency against a
-        # book that has kept moving, and the fill walks the ask side — so the
-        # combined cost can drift above $1 before both legs land. Verified
-        # 2026-08-07: fills landed at 0.31+0.73=1.04 and 0.17+0.89=1.06 (a
-        # guaranteed loss), yet the decision-time edge check had passed.
+        # (5) Re-validate the locked edge from the ACTUAL fills. Each leg
+        # filled after the simulated fill latency against a book that kept
+        # moving, so the combined cost can drift above $1 before both legs
+        # land (verified live: 0.31+0.73=1.04, 0.17+0.89=1.06). With EQUAL
+        # shares, holding to settlement is now exactly risk-free at a
+        # positive edge — _resolve_edge_loss only reverses when it loses
+        # strictly less than the (now exact) worst-case hold.
         combined_cost = yes_fill.avg_price + no_fill.avg_price
-        # Price-dependent fees per share: fee_rate * p * (1 - p) for each leg.
         fee_cost = (
-            fees.taker_fee_pct(yes_fill.avg_price, self._fee_rate_for(opportunity.market))
-            + fees.taker_fee_pct(no_fill.avg_price, self._fee_rate_for(opportunity.market))
+            fees.taker_fee_pct(yes_fill.avg_price, rate)
+            + fees.taker_fee_pct(no_fill.avg_price, rate)
         )
         locked_edge_pct = (1.0 - combined_cost) - fee_cost
         if locked_edge_pct <= 0:
-            # The "arbitrage" is gone at fill — but reversing is NOT
-            # automatically the right move: it sells both legs into the
-            # current bids, whose spread cost can far exceed the cost of
-            # holding the pair to settlement (live 2026-08-09: fills at 1.01,
-            # reversal sold at 0.865 → −$46.72, while the worst-case hold
-            # loss was similar and the best case profitable). _resolve_edge_loss
-            # reverses only when it loses LESS than holding; otherwise it
-            # holds to settlement, where the pair resolves normally.
             action = await self._resolve_edge_loss(
                 opportunity.market, yes_fill, no_fill, combo_group_id,
             )
             raise SumToOneEdgeLostError(combined_cost, locked_edge_pct, action=action)
 
         return yes_fill, no_fill
+
+    async def _place_equal_share_leg(
+        self, market: Market, side: str, shares: float,
+        quoted_avg: float, combo_group_id: str, book_source: Optional[object],
+    ) -> Fill:
+        """
+        Open ONE leg of an equal-share sum-to-one pair at EXACTLY `shares`
+        shares. Waits the simulated fill latency, re-walks the live book at
+        `shares` (the book may have moved), then records the trade at the
+        walked price with its price-dependent fee. Raises on failure so the
+        caller can reverse the sibling leg — a half-open hedge must never
+        persist silently.
+        """
+        token_id = market.token_id_yes if side == "YES" else market.token_id_no
+
+        async def _book() -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        if self.simulated_fill_latency_s > 0:
+            await asyncio.sleep(self.simulated_fill_latency_s)
+        book = await _book()
+        avg_price, filled = self._walk_book_for_shares(book, shares)
+        if filled < shares - 1e-9:
+            raise ValueError(
+                f"Equal-share leg {side}: only {filled:.2f} of {shares:.2f} shares "
+                "fillable after fill latency"
+            )
+        avg_price = _round_to_tick(avg_price, self.tick_size)
+        rate = self._fee_rate_for(market)
+        size_usd = shares * avg_price
+        fee_usd = shares * fees.taker_fee_per_share(avg_price, rate)
+        if size_usd + fee_usd > self.balance_usd:
+            raise InsufficientBalanceError(
+                f"Equal-share leg {side} cost ${size_usd + fee_usd:.2f} exceeds "
+                f"paper balance ${self.balance_usd:.2f}"
+            )
+        return await self._record_trade(
+            market, side, size_usd, avg_price, fee_usd,
+            strategy="sum_to_one", combo_group_id=combo_group_id,
+            slippage_pct=0.0, decision_best_ask=quoted_avg, fill_best_ask=avg_price,
+            shares=filled,
+        )
 
     # --- Sum-to-one MAKER execution (added 2026-08-12) ---------------------
     # Takers pay rate * p * (1 - p) per share on BOTH legs; MAKERS pay zero
@@ -715,19 +821,27 @@ class PaperBroker:
         if locked_edge_pct <= settings.SUM_TO_ONE_MIN_EDGE_PCT:
             return None
 
-        # Depth-aware sizing (Claude review 2026-08-12): the taker leg must
-        # be able to absorb `half` when the maker fills. Refuse to post a
-        # size the other book can't match — an oversized maker fill cannot
-        # be paired and becomes a naked position.
+        # Equal-share sizing (2026-08-12): the pair must be the SAME share
+        # count on both legs so the payout is identical regardless of
+        # outcome. `target_shares` is bounded by the caller's dollar budget
+        # at the current maker+taker prices, AND by the taker book's depth —
+        # a maker fill must be pairable, or it becomes a naked position
+        # (Claude review 2026-08-12).
+        per_share_cost_est = (
+            maker_price + taker_ask + fees.taker_fee_per_share(taker_ask, rate)
+        )
+        target_shares = total_size_usd / per_share_cost_est
         try:
-            self._walk_book_for_fill(taker_book, half)
+            self._walk_book_for_shares(taker_book, target_shares)
         except ValueError:
+            return None
+        if target_shares <= 0:
             return None
 
         # Reserve cash for the full pair (both legs + estimated taker fee).
-        # Refunded on cancel; adjusted to the actual fee on fill.
-        est_taker_fee = half * fees.taker_fee_fraction_of_notional(taker_ask, rate)
-        reserve = total_size_usd + est_taker_fee
+        # Refunded on cancel; adjusted to the actual fill on pair/reverse.
+        est_taker_fee = target_shares * fees.taker_fee_per_share(taker_ask, rate)
+        reserve = target_shares * (maker_price + taker_ask) + est_taker_fee
         if reserve > self.balance_usd:
             return None
         self.balance_usd -= reserve
@@ -739,20 +853,21 @@ class PaperBroker:
             combo_group_id=None,
             notes=(
                 f"maker={maker_side}@{maker_price:.3f} taker={taker_side}@ask "
-                f"locked_edge={locked_edge_pct:.2%} pair_total={total_size_usd:.2f}"
+                f"locked_edge={locked_edge_pct:.2%} target_shares={target_shares:.1f}"
             ),
         )
         order = MakerOrder(
             market=market, market_id=market.market_id,
             maker_side=maker_side, taker_side=taker_side,
             maker_price=maker_price, half_size_usd=half,
+            target_shares=target_shares,
             reserve_usd=reserve, posted_at=time.time(), db_row_id=db_row_id,
         )
         self._maker_orders[market.market_id] = order
         logger.info(
-            "[PAPER] Posted sum-to-one maker %s %s $%.2f @ bid %.3f "
+            "[PAPER] Posted sum-to-one maker %s %s %.1f shares @ bid %.3f "
             "(taker leg %s at ask %.3f, locked edge %.2f%%, reserved $%.2f)",
-            maker_side, market.market_id, half, maker_price,
+            maker_side, market.market_id, target_shares, maker_price,
             taker_side, taker_ask, locked_edge_pct * 100, reserve,
         )
         return order
@@ -806,10 +921,15 @@ class PaperBroker:
             )
             return f"maker_cancelled_timeout {market.market_id}"
 
-        # (2) Fill detection: the resting bid fills when ask-side sellers
-        # cross down to our price (spread collapse / adverse price action).
-        # Partial fills are handled honestly — only the filled portion is
-        # paired, so the pair never exceeds what actually filled.
+        # (2) Fill detection with a CONSERVATIVE queue model (fixed
+        # 2026-08-12, ChatGPT review): the resting bid sits at the BACK of
+        # the queue at its price — sellers crossing down to our level first
+        # consume the queue AHEAD of us (approximated as our own order size)
+        # before we fill. Ask depth at-or-below our price less than our own
+        # size only proves the PRICE touched our level, not that we were
+        # reached. A fill therefore requires crossing volume to EXCEED our
+        # size; partial fills are handled honestly — only the filled portion
+        # is paired.
         maker_token = market.token_id_yes if order.maker_side == "YES" else market.token_id_no
         maker_book = await self.feed.get_order_book(market.market_id, maker_token)
         crossing_shares = sum(
@@ -818,20 +938,29 @@ class PaperBroker:
         if crossing_shares <= 0:
             return None  # still resting
 
-        our_shares = order.half_size_usd / order.maker_price
-        fill_shares = min(our_shares, crossing_shares)
+        queue_ahead = order.target_shares  # conservative: at least our size is ahead
+        available = crossing_shares - queue_ahead
+        if available <= 1e-9:
+            return None  # price touched our level but the queue ahead wasn't consumed
+        fill_shares = min(order.target_shares, available)
         fill_usd = fill_shares * order.maker_price
 
-        # (3) The maker filled — immediately take the other leg, but only if
-        # the lock still holds. Quote the taker walk BEFORE opening anything.
+        # (3) The maker filled — immediately take the other leg at the SAME
+        # share count (equal-share pair), but only if the lock still holds.
+        # Quote the taker walk BEFORE opening anything.
         taker_token = market.token_id_yes if order.taker_side == "YES" else market.token_id_no
         taker_book = await self.feed.get_order_book(market.market_id, taker_token)
         try:
-            taker_avg, taker_shares = self._walk_book_for_fill(taker_book, fill_usd)
+            taker_avg, taker_shares = self._walk_book_for_shares(taker_book, fill_shares)
         except ValueError:
             return await self._reverse_maker(
                 order, fill_shares, fill_usd,
                 reason="taker leg book cannot absorb the fill",
+            )
+        if taker_shares < fill_shares - 1e-9:
+            return await self._reverse_maker(
+                order, fill_shares, fill_usd,
+                reason="taker leg filled only partially — cannot pair equal shares",
             )
         taker_avg = _round_to_tick(taker_avg, self.tick_size)
 
@@ -858,22 +987,26 @@ class PaperBroker:
         # combos.
         combo_group_id = str(uuid.uuid4())
         maker_fee = 0.0
-        taker_fee = fill_usd * fees.taker_fee_fraction_of_notional(taker_avg, rate)
+        taker_fee = fill_shares * fees.taker_fee_per_share(taker_avg, rate)
+        maker_size_usd = fill_shares * order.maker_price
+        taker_size_usd = fill_shares * taker_avg
         await self._record_trade(
-            market, order.maker_side, fill_usd, order.maker_price, maker_fee,
+            market, order.maker_side, maker_size_usd, order.maker_price, maker_fee,
             strategy="sum_to_one", combo_group_id=combo_group_id,
             slippage_pct=0.0, decision_best_ask=order.maker_price,
             fill_best_ask=order.maker_price, shares=fill_shares,
             deduct_balance=False,
         )
         await self._record_trade(
-            market, order.taker_side, fill_usd, taker_avg, taker_fee,
+            market, order.taker_side, taker_size_usd, taker_avg, taker_fee,
             strategy="sum_to_one", combo_group_id=combo_group_id,
             slippage_pct=0.0, decision_best_ask=taker_book.best_ask,
             fill_best_ask=taker_avg, shares=taker_shares,
             deduct_balance=False,
         )
-        actual_cost = fill_usd + fill_usd + taker_fee  # maker + taker legs + taker fee
+        # Both legs now open at the SAME share count (equal-share pair); the
+        # reservation covered the estimated cost, refund/adjust the delta.
+        actual_cost = maker_size_usd + taker_size_usd + taker_fee
         self.balance_usd += order.reserve_usd - actual_cost
 
         await self.db.resolve_maker_order(
@@ -958,31 +1091,6 @@ class PaperBroker:
             market.market_id, reason, filled, price, net_proceeds,
         )
         return f"maker_reversed {market.market_id}"
-
-    async def _quote_sum_to_one_fills(
-        self, market: Market, half_size_usd: float, book_source: Optional[object],
-    ) -> Optional[tuple[float, float]]:
-        """
-        Walk BOTH legs' ask sides and return the average fill price each leg
-        would ACTUALLY get for half_size_usd, or None if either book cannot
-        absorb its leg. This is the pre-place guard: the decision sees best
-        asks (which can sum below $1) while the fill walks the whole ask
-        side (which on a thin book sums above $1). Quote the real walk so a
-        guaranteed-losing combo is never opened in the first place.
-        """
-        async def _book(token_id: str) -> OrderBook:
-            if book_source is not None:
-                cached = book_source(token_id)
-                if cached is not None:
-                    return cached
-            return await self.feed.get_order_book(market.market_id, token_id)
-
-        try:
-            yes_avg, _ = self._walk_book_for_fill(await _book(market.token_id_yes), half_size_usd)
-            no_avg, _ = self._walk_book_for_fill(await _book(market.token_id_no), half_size_usd)
-        except ValueError:
-            return None
-        return yes_avg, no_avg
 
     async def _quote_reversal_net(self, market: Market, fill: Fill) -> Optional[float]:
         """

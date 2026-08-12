@@ -35,7 +35,7 @@ from engine.fees import round_trip_fee_pct
 from engine.lag_tracker import LagMeasurement, LagTracker
 from engine.latency import LatencyTracker
 from engine.risk import RiskManager, SignalForSizing
-from engine.signal import SignalEngine
+from engine.signal import Signal, SignalEngine
 from engine.single_instance import SingleInstanceLock
 from engine.sum_to_one import find_sum_to_one_opportunity
 from storage.db import Database
@@ -106,6 +106,48 @@ def fast_path_should_run(
     if last_price <= 0:
         return True
     return abs(price - last_price) / last_price >= trigger_pct
+
+
+def _sizing_inputs(signal: "Signal", yes_book: OrderBook, no_book: OrderBook) -> tuple[float, float]:
+    """
+    (post-fee edge, executable entry price) for Kelly sizing — the ACTUAL
+    side's best ask and the raw gap MINUS the round-trip fee. Fixed
+    2026-08-12: sizing previously used yes_book.mid and the RAW edge for
+    every trade, even NO buys — a NO entry at ~0.73 was sized as if buying
+    at 0.25, and the fee the firing gate already subtracted was re-added to
+    the size. entry_price is the target book's best ask (the price we can
+    actually execute at); net_edge mirrors the gate's own computation so
+    Kelly never sizes bigger than the post-fee edge justifies.
+    """
+    target_book = yes_book if signal.side == "YES" else no_book
+    entry_price = (
+        target_book.best_ask if target_book.best_ask is not None
+        else (target_book.mid or 0.5)
+    )
+    net_edge = signal.edge_pct - round_trip_fee_pct(
+        entry_price, fee_rate=settings.TAKER_FEE_PCT,
+    )
+    return max(net_edge, 0.0), entry_price
+
+
+def _median_reprice_hold_s(trades: list[dict], asset: str) -> Optional[float]:
+    """
+    Median hold time (exit_ts - entry_ts) of closed REPRICE trades for one
+    asset — the MEASURED reprice time behind the gap-timed exit (added
+    2026-08-12). None when no REPRICE winner exists for the asset yet: the
+    gap exit stays OFF until the strategy's own data exists, so a thin
+    sample can never force a sub-minute exit (GAP_EXIT_MIN_HOLD_S floors it
+    regardless).
+    """
+    holds = sorted(
+        t["exit_ts"] - t["entry_ts"]
+        for t in trades
+        if t.get("exit_reason") == "REPRICE"
+        and t.get("asset") == asset
+        and t.get("exit_ts") and t.get("entry_ts")
+        and t["exit_ts"] - t["entry_ts"] > 0
+    )
+    return holds[len(holds) // 2] if holds else None
 
 
 async def get_broker(db: Database, feed: PolymarketFeed, alerter) -> Union[PaperBroker, LiveBroker]:
@@ -210,6 +252,13 @@ class TradingApp:
             min_reprice_move=settings.LAG_REPRICE_MIN_MOVE,
             timeout_s=settings.LAG_TRACK_TIMEOUT_S,
         )
+        # Per-asset median REPRICE hold (seconds) driving the gap-timed exit,
+        # refreshed from closed trades every 10 min (see
+        # _refresh_reprice_stats). None per asset until its first REPRICE
+        # winner exists — the gap exit stays OFF until then (measurement-
+        # first, 2026-08-12).
+        self._reprice_stats: dict[str, Optional[float]] = {}
+        self._reprice_stats_at: float = 0.0
         # Per-symbol baseline (price, received_at) for the lag tracker.
         # 2026-08-08 fix (measured, not guessed): this used to compare each
         # tick to the PREVIOUS tick and required a 0.10% single-tick move —
@@ -981,10 +1030,15 @@ class TradingApp:
                     await self.latency.finish(cycle, fired=False)
                     return
 
+                # Kelly sizing must see the ACTUAL side's executable price and
+                # the POST-FEE edge (fixed 2026-08-12 — it previously always
+                # received yes_book.mid, even for NO buys, and the raw edge
+                # the firing gate had already netted against fees).
+                net_edge, entry_price = _sizing_inputs(signal, yes_book, no_book)
                 size_usd = self.risk.position_size(
                     SignalForSizing(
-                        edge_pct=signal.edge_pct,
-                        entry_price=yes_book.mid or 0.5,
+                        edge_pct=net_edge,
+                        entry_price=entry_price,
                         model_used=signal.model_used,
                     ),
                     current_balance=equity,
@@ -1161,6 +1215,11 @@ class TradingApp:
         if not isinstance(self.broker, PaperBroker):
             return
 
+        # Refresh the per-asset median REPRICE hold every 10 min (cheap: one
+        # trades read) — the measured input for the gap-timed exit below.
+        if time.time() - self._reprice_stats_at > 600:
+            await self._refresh_reprice_stats()
+
         open_trades = await self.db.get_open_trades(mode="PAPER")
         for t in open_trades:
             # Sum-to-one legs are outcome-agnostic by construction (we hold
@@ -1267,6 +1326,26 @@ class TradingApp:
                 await self._try_early_exit(market, t["id"], "TAKE_PROFIT")
                 continue
 
+            # Gap-timed exit (2026-08-12, measurement-first): if this asset
+            # has closed REPRICE winners, and this position has been held
+            # past a multiple of their median hold time WITHOUT repricing to
+            # even the fee floor, the convergence the strategy banks on has
+            # likely failed — exit instead of waiting out the 240s backstop
+            # exposed to a reversal. The median is measured from the bot's
+            # own closed REPRICE trades (None until the first one exists, so
+            # the exit stays off on a fresh run), and GAP_EXIT_MIN_HOLD_S
+            # floors the trigger so a thin sample can never force a
+            # sub-minute exit.
+            median_reprice_s = self._reprice_stats.get(t.get("asset"))
+            if median_reprice_s is not None:
+                gap_exit_after_s = max(
+                    median_reprice_s * settings.GAP_EXIT_MULTIPLIER,
+                    settings.GAP_EXIT_MIN_HOLD_S,
+                )
+                if held_s > gap_exit_after_s:
+                    await self._try_early_exit(market, t["id"], "GAP_EXPIRED")
+                    continue
+
             try:
                 yes_book = await self.feed.get_order_book(market.market_id, market.token_id_yes)
                 no_book = await self.feed.get_order_book(market.market_id, market.token_id_no)
@@ -1287,6 +1366,20 @@ class TradingApp:
                 and current_signal.edge_pct >= settings.EDGE_REVERSAL_EXIT_THRESHOLD_PCT
             ):
                 await self._try_early_exit(market, t["id"], "EDGE_REVERSAL")
+
+    async def _refresh_reprice_stats(self) -> None:
+        """Per-asset median REPRICE hold from closed trades — the measured
+        reprice time the gap-timed exit is built on (2026-08-12).
+        Measurement-only input; None per asset until its first REPRICE win,
+        so the gap exit never fires on data that doesn't exist yet."""
+        try:
+            trades = await self.db.get_all_trades(mode="PAPER")
+        except Exception:
+            logger.exception("Could not load trades for reprice statistics")
+            return
+        for asset in ("BTC", "ETH"):
+            self._reprice_stats[asset] = _median_reprice_hold_s(trades, asset)
+        self._reprice_stats_at = time.time()
 
     async def _try_early_exit(self, market: Market, trade_id: int, reason: str) -> None:
         try:
@@ -1837,6 +1930,7 @@ class TradingApp:
             try:
                 trades = await self.db.get_all_trades(mode="PAPER")
                 probes = await self.db.get_exit_probes()
+                lag_events = await self.db.get_lag_events()
                 summary = build_digest_summary(
                     all_trades=trades,
                     probes=probes,
@@ -1846,6 +1940,7 @@ class TradingApp:
                     live_min_trades=LIVE_GATE_MIN_TRADES,
                     live_min_days=LIVE_GATE_MIN_DAYS,
                     live_min_distinct_days=LIVE_GATE_MIN_DISTINCT_DAYS,
+                    lag_events=lag_events,
                 )
                 text = format_forensics_digest(summary)
                 await self.telegram_reporter.send_text(text)

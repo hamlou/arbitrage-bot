@@ -132,9 +132,11 @@ async def test_post_refused_when_insufficient_balance(broker):
 async def test_fill_pairs_both_legs_with_zero_fee_maker_leg(broker):
     order = await broker.post_sum_to_one_maker(make_market(), total_size_usd=100)
     assert order is not None
+    target = order.target_shares  # = 100 / (0.42 + 0.53) = 105.26 shares
 
-    # Sellers cross down to our resting bid: YES asks now at 0.42.
-    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 200)])
+    # Sellers cross down to our resting bid with MORE than our size (the
+    # conservative queue model needs crossing > our order to count as a fill).
+    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 500)])
     actions = await broker.check_sum_to_one_makers()
 
     assert actions and actions[0].startswith("maker_paired")
@@ -144,12 +146,15 @@ async def test_fill_pairs_both_legs_with_zero_fee_maker_leg(broker):
     assert len(trades) == 2
     yes_trade = next(t for t in trades if t["side"] == "YES")
     no_trade = next(t for t in trades if t["side"] == "NO")
-    # Maker leg: entered at the resting BID with ZERO fee; taker leg at the ask.
+    # Maker leg: entered at the resting BID with ZERO fee; taker leg at the
+    # ask — and BOTH legs carry the SAME share count (equal-share pair).
     assert yes_trade["entry_price"] == pytest.approx(0.42)
     assert yes_trade["fee_usd"] == pytest.approx(0.0)
     assert no_trade["entry_price"] == pytest.approx(0.53)
     assert no_trade["strategy"] == "sum_to_one"
     assert yes_trade["combo_group_id"] == no_trade["combo_group_id"]
+    assert yes_trade["size_usd"] / yes_trade["entry_price"] == pytest.approx(target)
+    assert no_trade["size_usd"] / no_trade["entry_price"] == pytest.approx(target)
 
     rows = await broker.db.get_maker_orders()
     assert len(rows) == 1
@@ -159,19 +164,43 @@ async def test_fill_pairs_both_legs_with_zero_fee_maker_leg(broker):
 
 
 async def test_fill_pairs_only_filled_portion(broker):
-    """A PARTIAL maker fill pairs only the filled portion — never more."""
+    """A PARTIAL maker fill pairs only the filled portion — never more, and
+    the two legs stay equal in SHARES even when their dollar sizes differ."""
     order = await broker.post_sum_to_one_maker(make_market(), total_size_usd=100)
     assert order is not None
+    target = order.target_shares
 
-    # Only $21 of ask depth crosses to our bid (0.42 * 50 shares).
-    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 50)])
+    # Crossing volume between our size and 2x our size -> partial fill of
+    # (crossing - target) shares (the queue ahead of us consumes the rest).
+    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 150)])
     actions = await broker.check_sum_to_one_makers()
     assert actions and actions[0].startswith("maker_paired")
 
     trades = await broker.db.get_open_trades(mode="PAPER")
     assert len(trades) == 2
-    assert trades[0]["size_usd"] == pytest.approx(21)   # 50 shares * 0.42
-    assert trades[1]["size_usd"] == pytest.approx(21)
+    yes_trade = next(t for t in trades if t["side"] == "YES")
+    no_trade = next(t for t in trades if t["side"] == "NO")
+    # Equal SHARES (the dollar sizes differ because the prices differ).
+    yes_shares = yes_trade["size_usd"] / yes_trade["entry_price"]
+    no_shares = no_trade["size_usd"] / no_trade["entry_price"]
+    assert yes_shares == pytest.approx(no_shares)
+    assert yes_shares == pytest.approx(150 - target)  # crossing - queue ahead
+
+
+async def test_no_fill_until_crossing_exceeds_our_queue(broker):
+    """Conservative queue model (fixed 2026-08-12): ask depth at-or-below
+    our bid that is SMALLER than our own order only proves the price touched
+    our level — our resting bid is at the BACK of the queue and does not
+    fill until the queue ahead (≈ our size) is consumed."""
+    order = await broker.post_sum_to_one_maker(make_market(), total_size_usd=100)
+    assert order is not None
+    target = order.target_shares
+
+    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, target - 10)])
+    actions = await broker.check_sum_to_one_makers()
+    assert actions == []
+    assert broker.has_pending_maker("m1") is True
+    assert broker.balance_usd == pytest.approx(900)  # still reserved
 
 
 # -- fill -> lock broken -> reverse -----------------------------------------
@@ -181,9 +210,10 @@ async def test_fill_with_broken_lock_reverses_maker_leg(broker):
     order = await broker.post_sum_to_one_maker(make_market(), total_size_usd=100)
     assert order is not None
 
-    # Maker fills, but the taker leg has walked up to 0.60: 0.42 + 0.60 > 1 —
-    # taking it would turn a guaranteed profit into a guaranteed loss.
-    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 200)])
+    # Maker fills (full: crossing > our size), but the taker leg has walked
+    # up to 0.60: 0.42 + 0.60 > 1 — taking it would turn a guaranteed profit
+    # into a guaranteed loss.
+    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 500)])
     broker.feed._books["tok_no"] = book([(0.50, 2000)], [(0.60, 2000)])
     actions = await broker.check_sum_to_one_makers()
 
@@ -192,9 +222,12 @@ async def test_fill_with_broken_lock_reverses_maker_leg(broker):
     # No positions were opened — the pair never became a trade.
     assert await broker.db.get_open_trades(mode="PAPER") == []
 
-    # Cash: reserved 100 at post, refunded, then maker P&L = -50 (fill) + sold
-    # 119.05 shares @ 0.40 = 47.62 (no fee) -> balance 997.62.
-    assert broker.balance_usd == pytest.approx(1000 - 100 + 100 - 50 + 50 / 0.42 * 0.40, abs=0.01)
+    # Cash: reserved at post (target * 0.95 = 100), refunded, then maker P&L
+    # = -fill_usd (target*0.42) + sold target shares @ 0.40 (no fee).
+    target = 100 / 0.95
+    assert broker.balance_usd == pytest.approx(
+        1000 - target * 0.42 + target * 0.40, abs=0.01
+    )
 
     rows = await broker.db.get_maker_orders()
     assert rows[0]["status"] == "REVERSED"
@@ -206,18 +239,19 @@ async def test_fill_with_no_bid_depth_rides_to_settlement(broker):
     assert order is not None
 
     # Maker fills; the maker side now has NO bid depth to sell into.
-    broker.feed._books["tok_yes"] = book([], [(0.42, 200)])
+    target = 100 / 0.95
+    broker.feed._books["tok_yes"] = book([], [(0.42, 500)])
     broker.feed._books["tok_no"] = book([(0.50, 2000)], [(0.60, 2000)])
     actions = await broker.check_sum_to_one_makers()
 
     assert actions and actions[0].startswith("maker_held_to_settlement")
     # The maker leg is recorded as a real (unpaired) trade so its settlement
     # P&L is realized honestly: cash = reserve refunded minus the fill cost.
-    assert broker.balance_usd == pytest.approx(1000 - 100 + 100 - 50)
+    assert broker.balance_usd == pytest.approx(1000 - target * 0.42)
     trades = await broker.db.get_open_trades(mode="PAPER")
     assert len(trades) == 1
     assert trades[0]["side"] == "YES"
-    assert trades[0]["size_usd"] == pytest.approx(50)
+    assert trades[0]["size_usd"] == pytest.approx(target * 0.42)
     assert trades[0]["fee_usd"] == pytest.approx(0.0)
     # And it settles normally when the market resolves.
     broker.feed._outcome = "YES"
@@ -258,26 +292,31 @@ async def test_still_pending_without_fill(broker):
 
 async def test_maker_leg_pays_zero_fee_and_reservation_matches(db):
     """With the real 0.07 rate: the maker leg's fee is zero, the taker leg
-    pays rate * (1 - p) of its notional, and the reservation covers exactly
-    the actual cost (no phantom refund)."""
+    pays rate * p * (1 - p) per share, and the equal-share reservation
+    covers EXACTLY the actual cost (per-share cost x share count == the
+    budget, so there is no phantom refund)."""
     feed = FakeFeed(default_books())
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.07)
 
     order = await broker.post_sum_to_one_maker(make_market(), total_size_usd=100)
     assert order is not None
-    # est taker fee = 50 * 0.07 * (1 - 0.53) = 1.645
-    assert broker.balance_usd == pytest.approx(1000 - 101.645, abs=0.001)
+    # target = 100 / (0.42 + 0.53 + fee(0.53)); reserve == the full budget.
+    fee_share = 0.07 * 0.53 * (1 - 0.53)
+    target = 100 / (0.42 + 0.53 + fee_share)
+    assert order.target_shares == pytest.approx(target)
+    assert order.reserve_usd == pytest.approx(100.0, abs=0.01)
+    assert broker.balance_usd == pytest.approx(900.0)
 
-    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 200)])
+    broker.feed._books["tok_yes"] = book([(0.40, 2000)], [(0.42, 500)])
     await broker.check_sum_to_one_makers()
 
     trades = await broker.db.get_open_trades(mode="PAPER")
     yes_trade = next(t for t in trades if t["side"] == "YES")
     no_trade = next(t for t in trades if t["side"] == "NO")
     assert yes_trade["fee_usd"] == pytest.approx(0.0)
-    assert no_trade["fee_usd"] == pytest.approx(50 * 0.07 * (1 - 0.53), abs=0.001)
+    assert no_trade["fee_usd"] == pytest.approx(target * fee_share, abs=0.01)
     # Balance exactly unchanged from post: reservation == actual cost.
-    assert broker.balance_usd == pytest.approx(1000 - 101.645, abs=0.001)
+    assert broker.balance_usd == pytest.approx(900.0, abs=0.01)
 
 
 # -- restart cleanup --------------------------------------------------------

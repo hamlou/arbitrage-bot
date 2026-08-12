@@ -7,6 +7,8 @@ automatically, without touching any threshold.
 """
 from __future__ import annotations
 
+import pytest
+
 from alerts.status_report import format_forensics_digest
 from engine.exit_forensics import build_digest_summary, classify_early_exits
 
@@ -110,6 +112,53 @@ def test_format_forensics_digest_renders_all_sections():
     assert "Freeze gate" in text and "100" in text
     assert "Live-trading gate" in text and "200" in text
     assert "Measurement only" in text
+
+
+def _lag_event(asset, move_dir, poly_move_pct, lag_ms=None, timed_out=0):
+    return {
+        "asset": asset, "move_dir": move_dir, "poly_move_pct": poly_move_pct,
+        "lag_ms": lag_ms, "timed_out": timed_out,
+    }
+
+
+def test_build_digest_summary_computes_lag_stats():
+    """The lag section (2026-08-12) is the empirical number that decides
+    whether gap-timed ENTRIES are ever safe: median lag, reprice rate, and
+    direction accuracy from lag_events."""
+    summary = build_digest_summary(
+        all_trades=[], probes=[], reprice_target=0.10,
+        freeze_min_trades=100, freeze_min_days=7.0,
+        live_min_trades=200, live_min_days=7.0, live_min_distinct_days=5,
+        lag_events=[
+            _lag_event("BTC", "UP", +0.010, lag_ms=2400),   # correct direction
+            _lag_event("BTC", "UP", +0.008, lag_ms=3100),   # correct direction
+            _lag_event("BTC", "DOWN", -0.005, lag_ms=1800), # correct direction
+            _lag_event("BTC", "UP", +0.002, lag_ms=4100),   # correct (small) direction
+            _lag_event("ETH", "UP", -0.003, lag_ms=None, timed_out=1),  # repriced WRONG way
+        ],
+    )
+    btc = summary["lag_stats"]["BTC"]
+    assert btc["n"] == 4
+    assert btc["median_lag_ms"] == pytest.approx(3100)  # sorted [1800, 2400, 3100, 4100] -> upper median
+    assert btc["repriced_pct"] == pytest.approx(100.0)
+    assert btc["correct_dir_pct"] == pytest.approx(100.0)
+    eth = summary["lag_stats"]["ETH"]
+    assert eth["n"] == 1
+    assert eth["repriced_pct"] == pytest.approx(0.0)      # timed out
+    assert eth["correct_dir_pct"] == pytest.approx(0.0)   # moved, but wrong way
+
+
+def test_format_forensics_digest_renders_lag_section():
+    summary = build_digest_summary(
+        all_trades=[], probes=[], reprice_target=0.10,
+        freeze_min_trades=100, freeze_min_days=7.0,
+        live_min_trades=200, live_min_days=7.0, live_min_distinct_days=5,
+        lag_events=[_lag_event("BTC", "UP", +0.010, lag_ms=2400)],
+    )
+    text = format_forensics_digest(summary)
+    assert "GAP MEASUREMENT" in text
+    assert "BTC" in text and "2400ms" in text
+    assert "right direction" in text
 
 
 def test_format_forensics_digest_handles_empty_run():

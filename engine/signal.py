@@ -491,6 +491,16 @@ class SignalEngine:
             (bid_usd / (bid_usd + ask_usd) * 100.0) if (bid_usd + ask_usd) > 0 else None
         )
 
+        # Execution book age (measurement-only, added 2026-08-12): how old
+        # the Polymarket book we evaluated against actually was. The WS cache
+        # treats books under STALE_AFTER_S (5s) as fresh, but the exploitable
+        # arbitrage window is ~2s — a 4.5s-old book is "fresh" by the feed
+        # and useless for execution. LOGGED ONLY so profit-vs-book-age can be
+        # analyzed after the 100+ trade bar; never gates.
+        book_age_s = None
+        if getattr(target_book, "fetched_at", None):
+            book_age_s = max(0.0, time.time() - target_book.fetched_at)
+
         # -- Fresh-move gate: only trade a REAL lag, never a drift --
         # The strategy's premise is "Polymarket LAGS a fresh Binance move."
         # The model's direction must therefore agree with the asset's ACTUAL
@@ -623,11 +633,12 @@ class SignalEngine:
             fired=fired, reason=reason, model_used=model_used,
         )
         if log:
-            await self._log(sig, tick_age, depth_usd, book_imbalance_pct)
+            await self._log(sig, tick_age, depth_usd, book_imbalance_pct, book_age_s)
         return sig
 
     async def _log(self, sig: Signal, tick_age: Optional[float], depth_usd: Optional[float] = None,
-                   book_imbalance_pct: Optional[float] = None) -> None:
+                   book_imbalance_pct: Optional[float] = None,
+                   poly_book_age_s: Optional[float] = None) -> None:
         await self.db.log_signal(
             market_id=sig.market.market_id,
             asset=sig.market.asset,
@@ -640,4 +651,5 @@ class SignalEngine:
             binance_tick_age_s=tick_age,
             book_depth_usd=depth_usd,
             book_imbalance_pct=book_imbalance_pct,
+            poly_book_age_s=poly_book_age_s,
         )

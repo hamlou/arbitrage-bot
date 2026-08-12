@@ -264,6 +264,20 @@ class Settings(BaseSettings):
     SUM_TO_ONE_DISCOVERY_LOOKAHEAD_S: float = 24 * 3600  # markets ending within 24h
     SUM_TO_ONE_DISCOVERY_MAX_MARKETS: int = 60           # cap book-polling load
     SUM_TO_ONE_DISCOVERY_MAX_PAGES: int = 5
+    # --- Gap-timed exit (added 2026-08-12, measurement-first) ------------
+    # If a position hasn't repriced within this multiple of the asset's
+    # MEASURED median REPRICE hold (from closed REPRICE trades), the
+    # convergence the strategy banks on has likely failed — exit instead of
+    # waiting out the flat REPRICE_EXIT_MAX_HOLD_S (240s) backstop exposed to
+    # a reversal. This is the "enter and get out inside the gap" idea applied
+    # to the EXIT side — no new direction prediction. Measurement-first: with
+    # zero closed REPRICE trades for an asset the exit stays OFF (no data
+    # yet), and GAP_EXIT_MIN_HOLD_S floors the trigger so a thin sample can
+    # never force a sub-minute exit. Provisional — re-evaluate at the 100+
+    # trade bar like any other threshold.
+    GAP_EXIT_MULTIPLIER: float = 1.5
+    GAP_EXIT_MIN_HOLD_S: float = 30.0
+
     # --- Sum-to-one maker execution (added 2026-08-12) ------------------
     # Takers pay the price-dependent fee (rate * p * (1 - p) per share);
     # MAKERS pay ZERO and earn a rebate (20% on crypto). Instead of taking

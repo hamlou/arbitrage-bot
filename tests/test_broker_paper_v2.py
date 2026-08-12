@@ -298,18 +298,16 @@ async def test_place_sum_to_one_order_buys_both_legs(db):
     assert None not in combo_ids
 
 
-async def test_sum_to_one_prechecks_total_cost_no_half_open_hedge(db):
-    """The combo's TOTAL cost (both legs + fees) is validated before either
-    leg opens. The sequential code could raise InsufficientBalanceError on the
-    second leg after the first already opened — leaving a HALF-OPEN hedge with
-    no reversal path (reviewed 2026-08-07)."""
+async def test_sum_to_one_sizes_down_to_fit_budget_no_half_open_hedge(db):
+    """The combo's TOTAL cost is validated before either leg opens, and the
+    equal-share size SHRINKS to whole shares the budget affords (risk-free
+    profit scaled to the budget, not refused). Balance $101 with a $100
+    budget: the pair opens at the affordable share count — both legs, one
+    combo — never a half-open hedge (reviewed 2026-08-07)."""
     books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
              "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
     feed = FakeFeed(books)
     market = make_market()
-    # Total cost = $100 + price-dependent fees (0.07 rate): at the 0.46/0.48
-    # asks that is ~$1.74 -> $101.74 total; balance $101 covers one leg's
-    # $51 but not both — each leg alone would pass its own per-leg check.
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=101, fee_pct=0.07)
 
     opp = find_sum_to_one_opportunity(
@@ -317,12 +315,35 @@ async def test_sum_to_one_prechecks_total_cost_no_half_open_hedge(db):
     )
     assert opp is not None
 
+    yes_fill, no_fill = await broker.place_sum_to_one_order(opp, total_size_usd=100)
+
+    open_trades = await db.get_open_trades(mode="PAPER")
+    assert len(open_trades) == 2
+    assert len({t["combo_group_id"] for t in open_trades}) == 1
+    # Equal-share sizing: BOTH legs carry the SAME share count.
+    assert yes_fill.shares == pytest.approx(no_fill.shares)
+    total_cost = yes_fill.size_usd + no_fill.size_usd + yes_fill.fee_usd + no_fill.fee_usd
+    assert total_cost <= 101
+
+
+async def test_sum_to_one_refuses_when_budget_below_one_pair(db):
+    """Balance below the per-share cost of ONE equal-share pair -> refuse
+    with InsufficientBalanceError; nothing opened, nothing debited."""
+    books = {"tok_yes": make_symmetric_book("tok_yes", best_ask=0.46),
+             "tok_no": make_symmetric_book("tok_no", best_ask=0.48)}
+    market = make_market()
+    broker = PaperBroker(db=db, feed=FakeFeed(books), starting_balance_usd=0.90, fee_pct=0.0)
+
+    opp = find_sum_to_one_opportunity(
+        market, books["tok_yes"], books["tok_no"], min_edge_pct=0.01, fee_pct=0.0,
+    )
+    assert opp is not None
+
     with pytest.raises(InsufficientBalanceError):
         await broker.place_sum_to_one_order(opp, total_size_usd=100)
 
-    # Nothing opened, nothing debited — no half-open hedge to clean up.
     assert await db.get_open_trades(mode="PAPER") == []
-    assert broker.balance_usd == pytest.approx(101)
+    assert broker.balance_usd == pytest.approx(0.90)
 
 
 async def test_sum_to_one_refuses_when_real_walk_exceeds_1(db):
@@ -377,7 +398,9 @@ async def test_sum_to_one_reverses_when_edge_evaporates_at_fill(db):
     # while bids stay near them, so a reversal is cheaper than holding.
     bad = {"tok_yes": make_symmetric_book("tok_yes", best_bid=0.52, best_ask=0.54),
            "tok_no": make_symmetric_book("tok_no", best_bid=0.50, best_ask=0.52)}
-    feed = MovingFeed(good, bad, good_for_first_n=2)
+    # good_for_first_n=1: the sizing/quote read (call 1 per token) sees the
+    # GOOD book, the post-latency fill read (call 2) sees the BAD one.
+    feed = MovingFeed(good, bad, good_for_first_n=1)
     market = make_market()
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
                          simulated_fill_latency_s=0.3)
@@ -410,7 +433,7 @@ async def test_sum_to_one_holds_when_reversal_loses_more_than_holding(db):
     # worse than the worst-case hold.
     bad = {"tok_yes": make_symmetric_book("tok_yes", best_bid=0.40, best_ask=0.52),
            "tok_no": make_symmetric_book("tok_no", best_bid=0.40, best_ask=0.50)}
-    feed = MovingFeed(good, bad, good_for_first_n=2)
+    feed = MovingFeed(good, bad, good_for_first_n=1)
     market = make_market()
     broker = PaperBroker(db=db, feed=feed, starting_balance_usd=1000, fee_pct=0.0,
                          simulated_fill_latency_s=0.3)

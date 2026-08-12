@@ -126,6 +126,13 @@ class Database:
             if "book_imbalance_pct" not in sig_columns:
                 logger.info("Migrating signals table: adding missing column 'book_imbalance_pct'")
                 await conn.execute("ALTER TABLE signals ADD COLUMN book_imbalance_pct REAL")
+            # Polymarket book age at evaluation (2026-08-12): how old the book
+            # we evaluated against actually was (WS cache age). Measurement-
+            # only — lets us analyze profit vs book age once a real sample
+            # exists; never gates.
+            if "poly_book_age_s" not in sig_columns:
+                logger.info("Migrating signals table: adding missing column 'poly_book_age_s'")
+                await conn.execute("ALTER TABLE signals ADD COLUMN poly_book_age_s REAL")
         await conn.commit()
 
     def _require_conn(self) -> aiosqlite.Connection:
@@ -149,6 +156,7 @@ class Database:
         binance_tick_age_s: Optional[float] = None,
         book_depth_usd: Optional[float] = None,
         book_imbalance_pct: Optional[float] = None,
+        poly_book_age_s: Optional[float] = None,
     ) -> int:
         conn = self._require_conn()
         cur = await conn.execute(
@@ -156,13 +164,13 @@ class Database:
             INSERT INTO signals
                 (ts, market_id, asset, implied_prob, polymarket_prob, edge_pct,
                  confidence, fired, reason, binance_tick_age_s, book_depth_usd,
-                 book_imbalance_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 book_imbalance_pct, poly_book_age_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.time(), market_id, asset, implied_prob, polymarket_prob,
                 edge_pct, confidence, int(fired), reason, binance_tick_age_s,
-                book_depth_usd, book_imbalance_pct,
+                book_depth_usd, book_imbalance_pct, poly_book_age_s,
             ),
         )
         await conn.commit()

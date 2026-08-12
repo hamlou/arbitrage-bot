@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS signals (
     reason          TEXT,                      -- why it fired or didn't
     binance_tick_age_s REAL,
     book_depth_usd  REAL,
-    book_imbalance_pct REAL                 -- bid/(bid+ask) USD depth @5 levels on the target book (measurement-only, never gates)
+    book_imbalance_pct REAL,                -- bid/(bid+ask) USD depth @5 levels on the target book (measurement-only, never gates)
+    poly_book_age_s  REAL                   -- age of the Polymarket book evaluated against (WS cache age; measurement-only)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id);

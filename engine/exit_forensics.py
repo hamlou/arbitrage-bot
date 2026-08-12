@@ -72,6 +72,36 @@ def classify_early_exits(
     }
 
 
+def _lag_stats(lag_events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-asset lag measurements from lag_events: sample count, median lag
+    (ms), reprice rate (1 - timed-out fraction), and direction accuracy —
+    of the moves whose implied token actually repriced, what fraction moved
+    the RIGHT way. This is the empirical number that will decide whether
+    gap-timed ENTRIES are ever safe (added 2026-08-12); pure measurement."""
+    by_asset: dict[str, list] = defaultdict(list)
+    for e in lag_events:
+        by_asset.setdefault(e.get("asset") or "?", []).append(e)
+
+    stats: dict[str, dict[str, Any]] = {}
+    for asset, events in by_asset.items():
+        n = len(events)
+        lags = sorted(e["lag_ms"] for e in events if e.get("lag_ms") is not None)
+        repriced = sum(1 for e in events if not e.get("timed_out"))
+        moved = [e for e in events if e.get("poly_move_pct") is not None]
+        correct = sum(
+            1 for e in moved
+            if (e.get("move_dir") == "UP" and e["poly_move_pct"] > 0)
+            or (e.get("move_dir") == "DOWN" and e["poly_move_pct"] < 0)
+        )
+        stats[asset] = {
+            "n": n,
+            "median_lag_ms": lags[len(lags) // 2] if lags else None,
+            "repriced_pct": repriced / n * 100.0 if n else None,
+            "correct_dir_pct": correct / len(moved) * 100.0 if moved else None,
+        }
+    return stats
+
+
 def build_digest_summary(
     all_trades: list[dict[str, Any]],
     probes: list[dict[str, Any]],
@@ -81,6 +111,7 @@ def build_digest_summary(
     live_min_trades: int,
     live_min_days: float,
     live_min_distinct_days: int,
+    lag_events: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
     Compact summary for the daily Telegram digest (and nothing else). All
@@ -131,4 +162,5 @@ def build_digest_summary(
         "live_min_trades": live_min_trades,
         "live_min_days": live_min_days,
         "live_min_distinct_days": live_min_distinct_days,
+        "lag_stats": _lag_stats(lag_events or []),
     }
