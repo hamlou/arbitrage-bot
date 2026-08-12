@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from data.polymarket_feed import Market, OrderBook
-from engine.fees import taker_fee_pct
+from engine.fees import fee_rate_for_category, taker_fee_pct
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,10 +47,14 @@ def find_sum_to_one_opportunity(
 
     profit_before_fees = 1.0 - combined_cost
     # Price-dependent taker fees (fee_rate * p * (1 - p) per share), charged
-    # on both legs. fee_pct here is the RATE (see engine/fees.py) — the old
-    # flat-fraction fee overstated extreme-price legs and understated
-    # mid-price legs.
-    fee_cost = taker_fee_pct(yes_ask, fee_pct) + taker_fee_pct(no_ask, fee_pct)
+    # on both legs. The RATE is CATEGORY-aware (docs.polymarket.com/trading/
+    # fees, added 2026-08-12): geopolitics is fee-free, politics/finance
+    # 0.04, crypto 0.07. A sub-$1 pair in a fee-free category is pure profit;
+    # charging it the crypto rate would hide exactly the opportunities the
+    # risk-free scan exists to find. fee_pct (the configured crypto rate) is
+    # the fallback for markets whose category is unknown.
+    rate = fee_rate_for_category(market.category) if market.category else fee_pct
+    fee_cost = taker_fee_pct(yes_ask, rate) + taker_fee_pct(no_ask, rate)
     net_profit_pct = (profit_before_fees - fee_cost) / combined_cost
 
     if net_profit_pct <= min_edge_pct:

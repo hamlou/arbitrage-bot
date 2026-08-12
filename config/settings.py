@@ -100,26 +100,21 @@ class Settings(BaseSettings):
     MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.58
     # Polymarket's crypto taker fee RATE — NOT a flat fraction. The per-share
     # fee is fee_rate * p * (1 - p); as a fraction of what you spend that is
-    # fee_rate * (1 - p) per side (~3% of notional at p=0.50, ~1.2% at
+    # fee_rate * (1 - p) per side (~3.5% of notional at p=0.50, ~1.5% at
     # p=0.80). A taker round trip pays it twice, so at p~0.5 the fee hurdle
-    # is ~6% of notional before spread. All fee math lives in engine/fees.py;
-    # this setting is the single source of truth for the RATE.
-    # BEST-AVAILABLE ESTIMATE, not settled fact (documented honestly
-    # 2026-08-08): the formula SHAPE is verified — "Fees are computed using a
-    # symmetric formula that scales with price uncertainty: Fee = Theta x C x
-    # p x (1 - p)" (docs.polymarket.us/fees, effective 2026-07-01, Theta =
-    # 0.06 taker / -0.0125 maker rebate). The exact RATE is disputed across
-    # sources: the official .us docs say 0.06; multiple third-party write-ups
-    # of the same period cite 0.07 (some with an exponent). The bot trades
-    # the GLOBAL platform (Polymarket.com), whose fee page we could not load
-    # authoritatively, so 0.06 is our best available estimate of the rate —
-    # revisit before any live trading, and prefer the higher value if
-    # uncertainty persists (understating costs is the dangerous direction).
-    # Either way the conclusion holds: mid-price (~0.50) round trips face a
-    # real fee wall; extreme-price entries face a much smaller one. The flat
-    # 2% assumption (pre-2026-08-07) UNDERSTATED mid-price fees — paper
+    # is ~7% of notional before spread. All fee math lives in engine/fees.py;
+    # this setting is the single source of truth for the RATE (directional
+    # universe fallback).
+    # CONFIRMED 2026-08-12 against docs.polymarket.com/trading/fees (the
+    # authoritative page now loads): "Crypto: taker fee rate 0.07" — the
+    # earlier 0.06 was a best-effort estimate from 2026-08-08 while the page
+    # was unreachable. The fee is CATEGORY-dependent: crypto 0.07, sports/
+    # economics/culture/weather/other 0.05, finance/politics/mentions/tech
+    # 0.04, geopolitics FREE (fee_rate_for_category in engine/fees.py is the
+    # single source of truth; the sum-to-one scan applies it per market). The
+    # flat 2% assumption (pre-2026-08-07) UNDERSTATED mid-price fees — paper
     # results looked better than live.
-    TAKER_FEE_PCT: float = 0.06
+    TAKER_FEE_PCT: float = 0.07
     # Cross-exchange sanity gate: before firing a signal, the latest known
     # Binance and Coinbase prices for the asset must agree within this many
     # percent (0.1 = 0.1%). A bigger divergence usually means one feed is

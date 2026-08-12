@@ -126,6 +126,18 @@ class PaperBroker:
         # it gets rebuilt after a restart.
         self._open_positions: dict[str, list[int]] = {}
 
+    def _fee_rate_for(self, market: Market) -> float:
+        """Category-aware taker fee RATE for a market (docs.polymarket.com/
+        trading/fees, added 2026-08-12): geopolitics is fee-free, politics/
+        finance 0.04, crypto 0.07. Falls back to the configured rate when the
+        market's category is unknown. All fee charges flow through this so
+        paper P&L matches what Polymarket would actually collect — a sum-to-
+        one pair on a geopolitics market must not be charged the crypto rate.
+        """
+        if market.category:
+            return fees.fee_rate_for_category(market.category)
+        return self.fee_pct
+
     @property
     def mode(self) -> str:
         return "PAPER"
@@ -344,7 +356,7 @@ class PaperBroker:
         # (rate * p * (1 - p)); as a fraction of what we SPEND that is
         # rate * (1 - p) — ~3.5% of notional at p=0.50, less at higher
         # prices. The old flat fee_pct assumption understated mid-price fees.
-        fee_usd = size_usd * fees.taker_fee_fraction_of_notional(avg_price, self.fee_pct)
+        fee_usd = size_usd * fees.taker_fee_fraction_of_notional(avg_price, self._fee_rate_for(market))
 
         total_cost = size_usd + fee_usd
         if total_cost > self.balance_usd:
@@ -429,8 +441,8 @@ class PaperBroker:
             )
         quoted_cost = quoted[0] + quoted[1]
         quoted_fee_cost = (
-            fees.taker_fee_pct(quoted[0], self.fee_pct)
-            + fees.taker_fee_pct(quoted[1], self.fee_pct)
+            fees.taker_fee_pct(quoted[0], self._fee_rate_for(opportunity.market))
+            + fees.taker_fee_pct(quoted[1], self._fee_rate_for(opportunity.market))
         )
         quoted_edge = (1.0 - quoted_cost) - quoted_fee_cost
         if quoted_edge <= 0:
@@ -454,8 +466,8 @@ class PaperBroker:
         # edge-revalidation below never sees. Each leg is half the size, so
         # total fee = half*(fee(yes_fill) + fee(no_fill)) at the QUOTED
         # prices.
-        fee_yes = half * fees.taker_fee_fraction_of_notional(quoted[0], self.fee_pct)
-        fee_no = half * fees.taker_fee_fraction_of_notional(quoted[1], self.fee_pct)
+        fee_yes = half * fees.taker_fee_fraction_of_notional(quoted[0], self._fee_rate_for(opportunity.market))
+        fee_no = half * fees.taker_fee_fraction_of_notional(quoted[1], self._fee_rate_for(opportunity.market))
         total_cost = total_size_usd + fee_yes + fee_no
         if total_cost > self.balance_usd:
             raise InsufficientBalanceError(
@@ -519,8 +531,8 @@ class PaperBroker:
         combined_cost = yes_fill.avg_price + no_fill.avg_price
         # Price-dependent fees per share: fee_rate * p * (1 - p) for each leg.
         fee_cost = (
-            fees.taker_fee_pct(yes_fill.avg_price, self.fee_pct)
-            + fees.taker_fee_pct(no_fill.avg_price, self.fee_pct)
+            fees.taker_fee_pct(yes_fill.avg_price, self._fee_rate_for(opportunity.market))
+            + fees.taker_fee_pct(no_fill.avg_price, self._fee_rate_for(opportunity.market))
         )
         locked_edge_pct = (1.0 - combined_cost) - fee_cost
         if locked_edge_pct <= 0:
@@ -580,7 +592,7 @@ class PaperBroker:
         if filled <= 0 or filled < shares - 1e-9:
             return None
         proceeds = filled * price
-        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(price, self.fee_pct)
+        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(price, self._fee_rate_for(market))
         return proceeds - exit_fee
 
     async def _resolve_edge_loss(
@@ -720,8 +732,8 @@ class PaperBroker:
 
         proceeds = filled_shares * exit_price
         # Exit is a taker sell — the same price-dependent fee applies (fraction
-        # of the proceeds, rate * (1 - p) at the exit price).
-        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(exit_price, self.fee_pct)
+        # of the proceeds, rate * (1 - p) at the exit price), category-aware.
+        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(exit_price, self._fee_rate_for(market))
         net_proceeds = proceeds - exit_fee
         realized_pnl = net_proceeds - trade["size_usd"] - trade["fee_usd"]
 

@@ -13,9 +13,11 @@ As a fraction of what you actually spend (C * p), that works out to:
 
     fee / notional = fee_rate * (1 - p)
 
-i.e. ~3% of notional per side at p = 0.50, ~1.3% at p = 0.78, and larger at
-low prices. A taker round trip (entry + exit) pays it twice, so the
-round-trip fee hurdle at p ~ 0.5 is ~6% of notional BEFORE spread.
+i.e. ~3.5% of notional per side at p = 0.50 (crypto rate 0.07), ~1.5% at
+p = 0.78, and larger at low prices. A taker round trip (entry + exit) pays
+it twice, so the round-trip fee hurdle at p ~ 0.5 is ~7% of notional BEFORE
+spread. The rate is CATEGORY-dependent (crypto 0.07 … geopolitics free) —
+see fee_rate_for_category.
 
 Why this matters for this strategy (verified 2026-08-07): the earlier flat
 2% fee assumption UNDERSTATED mid-price fees — paper results looked better
@@ -28,16 +30,68 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Polymarket's taker fee RATE (fee coefficient Theta). BEST-AVAILABLE
-# ESTIMATE (2026-08-08), not settled fact: the formula shape is verified
-# (docs.polymarket.us/fees, effective 2026-07-01: "Fee = Theta x C x p x
-# (1 - p)", Theta = 0.06 taker / -0.0125 maker rebate), but third-party
-# sources for the same period cite 0.07 (some with an exponent), and the
-# bot's venue is the global Polymarket.com whose authoritative fee page we
-# could not load. 0.06 is our best available estimate; revisit before live
-# trading and prefer the higher value if uncertainty persists.
-# Applied as fee_rate * p * (1 - p) per share.
-DEFAULT_TAKER_FEE_RATE = 0.06
+# Polymarket's crypto taker fee RATE (fee coefficient Theta). Confirmed
+# 2026-08-12 against docs.polymarket.com/trading/fees (authoritative, live):
+# "Crypto: taker fee rate 0.07", fee = rate * p * (1 - p) per share, makers
+# pay zero and earn a rebate. The earlier 0.06 estimate (2026-08-08, from a
+# period when the authoritative page was unreachable) was stale — the docs
+# now load and the crypto rate is 0.07. NOTE: the rate is CATEGORY-dependent
+# (see fee_rate_for_category below) — crypto is the most expensive at 0.07
+# while geopolitics is fee-free. Applied as fee_rate * p * (1 - p) per share.
+DEFAULT_TAKER_FEE_RATE = 0.07
+
+# --- Category-aware fee rates (docs.polymarket.com/trading/fees, 2026-08-12) --
+# The taker fee rate differs by market category. Geopolitics is fee-FREE;
+# crypto is the most expensive (the dynamic fee model introduced Jan 2026
+# specifically to curb latency arbitrage on the short-duration crypto
+# markets). Makers pay 0 everywhere and earn a rebate (20% on crypto).
+CATEGORY_FEE_RATES: dict[str, float] = {
+    "crypto": 0.07,
+    "sports": 0.05,
+    "finance": 0.04,
+    "politics": 0.04,
+    "economics": 0.05,
+    "culture": 0.05,
+    "weather": 0.05,
+    "other": 0.05,
+    "mentions": 0.04,
+    "tech": 0.04,
+    "geopolitics": 0.0,
+}
+
+# Gamma exposes the category as a TAG label on the event payload, not as a
+# dedicated field (verified live 2026-08-12: event["category"] is None;
+# labels like "Politics", "Geopolitics", "Sports" arrive in tags[]). Map
+# tag labels -> category key.
+_TAG_TO_CATEGORY: dict[str, str] = {
+    "crypto": "crypto",
+    "sports": "sports",
+    "finance": "finance",
+    "financial": "finance",
+    "politics": "politics",
+    "economics": "economics",
+    "economy": "economics",
+    "culture": "culture",
+    "weather": "weather",
+    "mentions": "mentions",
+    "tech": "tech",
+    "technology": "tech",
+    "geopolitics": "geopolitics",
+}
+
+
+def fee_rate_for_category(category: Optional[str]) -> float:
+    """Taker fee RATE for a market's category/tag label, per the official
+    fee schedule. Returns the "other/general" rate (0.05) for unknown or
+    missing categories — deliberately NOT the crypto rate: the whole point
+    of category-awareness is that only crypto pays 0.07 while geopolitics is
+    free and politics/finance are 0.04. The short-duration BTC/ETH up/down
+    markets are category "crypto" (0.07), which is why DEFAULT_TAKER_FEE_RATE
+    matches."""
+    if not category:
+        return CATEGORY_FEE_RATES["other"]
+    key = _TAG_TO_CATEGORY.get(category.strip().lower(), "other")
+    return CATEGORY_FEE_RATES[key]
 
 
 def taker_fee_per_share(price: float, fee_rate: float = DEFAULT_TAKER_FEE_RATE) -> float:

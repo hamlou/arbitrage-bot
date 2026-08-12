@@ -131,6 +131,13 @@ class Market:
     # wrong. Flagged clearly rather than silently assumed correct.
     reference_price: Optional[float] = None
     expires_at_ts: Optional[float] = None  # parsed from end_date_iso
+    # Fee category ("crypto", "politics", "geopolitics", ...) derived from
+    # Gamma's event tags. Drives the category-aware taker fee rate in
+    # engine/fees.fee_rate_for_category — geopolitics is fee-free while
+    # crypto pays 0.07, so the sum-to-one scan must know the category to
+    # price a pair honestly. None when the tags don't identify a known
+    # category (callers then fall back to the configured crypto rate).
+    category: Optional[str] = None
 
     def with_reference_price(self, price: float) -> "Market":
         """Frozen dataclass — returns a copy with reference_price set."""
@@ -586,6 +593,9 @@ def _parse_gamma_market(m: dict[str, Any]) -> Optional[Market]:
         duration_minutes=duration,
         resolved=bool(m.get("closed", False)),
         expires_at_ts=expires_at_ts,
+        # Short-duration BTC/ETH up/down windows are the crypto category by
+        # construction — the most fee-heavy tier (0.07).
+        category="crypto",
     )
 
 
@@ -629,4 +639,28 @@ def _parse_any_binary_market(m: dict[str, Any]) -> Optional[Market]:
         end_date_iso=end_date_iso,
         resolved=bool(m.get("closed", False)),
         expires_at_ts=expires_at_ts,
+        category=_category_from_tags(m.get("tags") or []),
     )
+
+
+def _category_from_tags(tags: list) -> Optional[str]:
+    """Derive the fee category from Gamma's event tags. Gamma puts the
+    category in the tags[] labels ("Politics", "Geopolitics", "Sports",
+    "Crypto", ...) rather than in a dedicated event.category field
+    (verified live 2026-08-12: event["category"] is None). Returns the first
+    known category label in tag order, or None."""
+    from engine.fees import _TAG_TO_CATEGORY
+
+    for tag in tags:
+        if isinstance(tag, dict):
+            label = tag.get("label") or tag.get("slug")
+        elif isinstance(tag, str):
+            label = tag
+        else:
+            continue
+        if not label:
+            continue
+        key = _TAG_TO_CATEGORY.get(str(label).strip().lower())
+        if key is not None:
+            return key
+    return None
