@@ -48,6 +48,31 @@ CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_combo_group ON trades(combo_group_id);
 
+-- Resting maker orders for the sum-to-one leg (added 2026-08-12): one
+-- leg posts at the bid (maker = zero fee + rebate), the other is taken the
+-- instant the maker leg fills. Audit trail only — the live lifecycle lives
+-- in the paper broker's in-memory registry (a resting order dies with the
+-- process, like a real broker connection).
+CREATE TABLE IF NOT EXISTS maker_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,          -- posted (unix epoch seconds)
+    market_id       TEXT    NOT NULL,
+    side            TEXT    NOT NULL,          -- YES / NO — the posted (maker) leg
+    token_id        TEXT    NOT NULL,
+    price           REAL    NOT NULL,          -- resting limit price (best bid at post)
+    size_usd        REAL    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING / FILLED / REVERSED / CANCELLED
+    filled_price    REAL,                      -- maker leg fill price (= resting price)
+    taker_leg_price REAL,                      -- the taken leg's avg fill at pair open
+    combined_cost   REAL,                      -- filled_price + taker_leg_price (before fees)
+    taker_fee_usd   REAL,                      -- fee on the taken leg only (maker leg = 0)
+    combo_group_id  TEXT,
+    notes           TEXT,
+    resolved_at     REAL
+);
+CREATE INDEX IF NOT EXISTS idx_maker_orders_status ON maker_orders(status);
+CREATE INDEX IF NOT EXISTS idx_maker_orders_market ON maker_orders(market_id);
+
 CREATE TABLE IF NOT EXISTS equity_curve (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              REAL    NOT NULL,

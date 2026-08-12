@@ -249,6 +249,72 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    # -- maker orders (sum-to-one resting leg, audit trail only) ----------
+
+    async def log_maker_order(
+        self,
+        *,
+        market_id: str,
+        side: str,
+        token_id: str,
+        price: float,
+        size_usd: float,
+        combo_group_id: Optional[str] = None,
+        notes: str = "",
+    ) -> int:
+        """Record a posted resting maker order (PENDING). The live lifecycle
+        lives in the paper broker's in-memory registry; this is the audit
+        trail so a bot restart doesn't erase what was posted."""
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """
+            INSERT INTO maker_orders
+                (ts, market_id, side, token_id, price, size_usd, status,
+                 combo_group_id, notes)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+            """,
+            (time.time(), market_id, side, token_id, price, size_usd,
+             combo_group_id, notes),
+        )
+        await conn.commit()
+        return cur.lastrowid
+
+    async def resolve_maker_order(
+        self,
+        maker_order_id: int,
+        *,
+        status: str,  # FILLED / REVERSED / CANCELLED
+        filled_price: Optional[float] = None,
+        taker_leg_price: Optional[float] = None,
+        combined_cost: Optional[float] = None,
+        taker_fee_usd: Optional[float] = None,
+        notes: str = "",
+    ) -> None:
+        """Close out a maker order row with its outcome."""
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            UPDATE maker_orders
+            SET status = ?, filled_price = ?, taker_leg_price = ?,
+                combined_cost = ?, taker_fee_usd = ?, notes = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (status, filled_price, taker_leg_price, combined_cost, taker_fee_usd,
+             notes, time.time(), maker_order_id),
+        )
+        await conn.commit()
+
+    async def get_maker_orders(self, *, status: Optional[str] = None) -> list[dict[str, Any]]:
+        conn = self._require_conn()
+        if status:
+            cur = await conn.execute(
+                "SELECT * FROM maker_orders WHERE status = ? ORDER BY ts", (status,)
+            )
+        else:
+            cur = await conn.execute("SELECT * FROM maker_orders ORDER BY ts")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def set_trade_excursion(self, trade_id: int, mfe_pct: float, mae_pct: float) -> None:
         """Persist the tracked max favorable / adverse excursion at trade close."""
         conn = self._require_conn()

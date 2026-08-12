@@ -264,6 +264,20 @@ class Settings(BaseSettings):
     SUM_TO_ONE_DISCOVERY_LOOKAHEAD_S: float = 24 * 3600  # markets ending within 24h
     SUM_TO_ONE_DISCOVERY_MAX_MARKETS: int = 60           # cap book-polling load
     SUM_TO_ONE_DISCOVERY_MAX_PAGES: int = 5
+    # --- Sum-to-one maker execution (added 2026-08-12) ------------------
+    # Takers pay the price-dependent fee (rate * p * (1 - p) per share);
+    # MAKERS pay ZERO and earn a rebate (20% on crypto). Instead of taking
+    # BOTH legs, post ONE leg as a resting maker order at the bid and, the
+    # instant it fills, take the other leg at market — roughly half the fee
+    # AND a strictly cheaper maker price (bid < ask). The exposure window
+    # between the two legs is one API round trip, not an open-ended
+    # cancel-and-reverse wait, so a naked directional position can never
+    # persist. The cheap leg is the maker (its fee is the larger fraction of
+    # notional), the expensive leg is taken. The resting order is
+    # depth-checked (never size beyond what the counterparty book can match)
+    # and cancelled if the lock dies before it fills.
+    SUM_TO_ONE_MAKER_ENABLED: bool = True
+    SUM_TO_ONE_MAKER_TIMEOUT_S: float = 90.0
 
     # --- Market discovery -----------------------------------------------
     # Decoupled from the (much faster) per-cycle signal evaluation loop — no

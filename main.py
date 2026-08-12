@@ -705,11 +705,28 @@ class TradingApp:
         if not isinstance(self.broker, PaperBroker) or not self._sto_markets:
             return
 
+        # First advance any resting maker orders (fill -> take the other leg
+        # / reverse; timeout -> cancel). This runs BEFORE scanning new
+        # opportunities so a just-filled maker's taker leg is paired the same
+        # cycle it fills, and the exposure freed by a cancel is available to
+        # the new scan.
+        if settings.SUM_TO_ONE_MAKER_ENABLED:
+            try:
+                for action in await self.broker.check_sum_to_one_makers():
+                    await self.alerter.send_alert(
+                        f"[{self.broker.mode}] Sum-to-one maker: {action}",
+                        level=AlertLevel.INFO,
+                    )
+            except Exception:
+                logger.exception("Sum-to-one maker check failed this cycle")
+
         for market in list(self._sto_markets.values()):
             if market.market_id in self._known_markets:
                 continue  # the directional cycle already scans this one
             if self.broker.has_open_position(market.market_id):
                 continue
+            if self.broker.has_pending_maker(market.market_id):
+                continue  # already resting an order on this market
             async with self._entry_lock:
                 if self.broker.has_open_position(market.market_id):
                     continue
@@ -737,6 +754,26 @@ class TradingApp:
                 sto_size = min(settings.SUM_TO_ONE_MAX_POSITION_PCT * equity, headroom, cash)
                 if sto_size < self.broker.min_order_size_usd * 2:
                     continue
+
+                # Maker-first execution (2026-08-12): when enabled, post the
+                # cheaper leg as a resting buy at the bid (zero fee + cheaper
+                # price) and take the other leg the instant it fills. If the
+                # pair can't be posted as a maker (no bid, taker book too
+                # thin, lock not clearing), fall back to the both-legs-taker
+                # flow so a viable opportunity is never missed.
+                maker_order = None
+                if settings.SUM_TO_ONE_MAKER_ENABLED:
+                    maker_order = await self.broker.post_sum_to_one_maker(market, sto_size)
+                if maker_order is not None:
+                    await self.alerter.send_alert(
+                        f"[{self.broker.mode}] Sum-to-one maker posted {market.asset} "
+                        f"'{market.question[:44]}' ${sto_size:.2f} "
+                        f"({maker_order.maker_side} @ bid {maker_order.maker_price:.3f}, "
+                        f"taker leg {maker_order.taker_side}; locked edge "
+                        f"{(1 - maker_order.maker_price - sto.no_ask if maker_order.maker_side == 'YES' else 1 - sto.yes_ask - maker_order.maker_price):.2%})",
+                        level=AlertLevel.INFO,
+                    )
+                    return  # one risk-free entry per cycle is enough
 
                 try:
                     yes_fill, no_fill = await self.broker.place_sum_to_one_order(sto, sto_size)

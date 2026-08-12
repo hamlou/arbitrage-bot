@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+from config.settings import settings
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed
 from engine import fees
 from engine.fees import DEFAULT_TAKER_FEE_RATE
@@ -37,6 +38,32 @@ class Fill:
     shares: float
     fee_usd: float
     slippage_pct: float  # (avg_price - book_mid_at_decision) / book_mid_at_decision
+
+
+@dataclass(slots=True)
+class MakerOrder:
+    """
+    One resting sum-to-one maker order (added 2026-08-12): the CHEAPER leg
+    of a sub-$1 YES+NO pair is posted as a resting BUY at the bid (maker =
+    zero fee, and bid < ask so a strictly better entry price), and the
+    instant it fills the OTHER leg is taken at market. This replaces the
+    both-legs-taker flow's "cancel and reverse a half-open hedge" window —
+    the exposure gap between the two legs shrinks to one book read.
+
+    Lifecycle (in-memory; dies with the process like a real broker
+    connection — the DB row is the audit trail only):
+      PENDING -> FILLED (both legs opened as a combo) | REVERSED | CANCELLED
+    """
+    market: Market
+    market_id: str
+    maker_side: str       # YES / NO — the CHEAPER leg, resting at the bid
+    taker_side: str       # YES / NO — the other leg, taken at market on fill
+    maker_price: float    # resting limit price (= best bid at post)
+    half_size_usd: float  # dollar size of EACH leg (pair total = 2 * half)
+    reserve_usd: float    # cash reserved at post (pair cost + est. taker fee)
+    posted_at: float
+    db_row_id: int
+    status: str = "PENDING"  # PENDING / FILLED / REVERSED / CANCELLED
 
 
 class InsufficientBalanceError(Exception):
@@ -125,6 +152,12 @@ class PaperBroker:
         # always the DB — this is a cache, and load_open_positions() is how
         # it gets rebuilt after a restart.
         self._open_positions: dict[str, list[int]] = {}
+        # market_id -> resting sum-to-one maker order (see MakerOrder).
+        # In-memory only: a resting order dies with the process, exactly like
+        # a real broker connection. The DB maker_orders rows are the audit
+        # trail; load_open_positions() marks any stale PENDING rows CANCELLED
+        # so a restart never leaves phantom "open" resting orders.
+        self._maker_orders: dict[str, MakerOrder] = {}
 
     def _fee_rate_for(self, market: Market) -> float:
         """Category-aware taker fee RATE for a market (docs.polymarket.com/
@@ -184,6 +217,21 @@ class PaperBroker:
         except Exception:
             logger.exception("Could not reconstruct paper balance from ledger; keeping in-memory value")
 
+        # A resting maker order cannot survive a restart (the in-memory
+        # registry is rebuilt empty — the maker_orders rows are the audit
+        # trail only). Mark any PENDING rows CANCELLED so the trail doesn't
+        # show phantom open orders. Their cash was never in the ledger
+        # (reserved only in memory), so the reconstructed balance above is
+        # already correct.
+        try:
+            for row in await self.db.get_maker_orders(status="PENDING"):
+                await self.db.resolve_maker_order(
+                    row["id"], status="CANCELLED",
+                    notes="process restart — resting order dropped with the broker connection",
+                )
+        except Exception:
+            logger.exception("Could not clean stale PENDING maker orders on load")
+
         if open_trades:
             logger.info(
                 "Restored %d open paper position(s) across %d market(s) from DB, balance $%.2f",
@@ -197,9 +245,19 @@ class PaperBroker:
     async def get_total_exposure_usd(self) -> float:
         """Sum of size_usd across every currently open position — the input
         to the portfolio-level MAX_TOTAL_EXPOSURE_PCT cap, distinct from the
-        per-trade MAX_POSITION_PCT cap."""
+        per-trade MAX_POSITION_PCT cap. Pending sum-to-one maker orders count
+        too: their cash is already reserved at post (see post_sum_to_one_maker),
+        so sizing a second entry against that money would overshoot the cap."""
         open_trades = await self.db.get_open_trades(mode=self.mode)
-        return sum(t["size_usd"] for t in open_trades)
+        exposure = sum(t["size_usd"] for t in open_trades)
+        exposure += sum(o.reserve_usd for o in self._maker_orders.values())
+        return exposure
+
+    def has_pending_maker(self, market_id: str) -> bool:
+        """True if a resting sum-to-one maker order is outstanding on this
+        market — the scan must not post a second one on the same market."""
+        o = self._maker_orders.get(market_id)
+        return o is not None and o.status == "PENDING"
 
     async def get_equity(self, known_markets: dict[str, Market]) -> float:
         """
@@ -364,8 +422,6 @@ class PaperBroker:
                 f"Order cost incl. fees ${total_cost:.2f} exceeds paper balance ${self.balance_usd:.2f}"
             )
 
-        self.balance_usd -= total_cost
-
         # Fill-realism measurement (verified 2026-08-07): the paper broker
         # computes slippage on every fill but previously threw it away — so
         # the most useful paper-mode metric (how much edge is lost between
@@ -375,6 +431,40 @@ class PaperBroker:
         if mid_before:
             slippage_pct = (avg_price - mid_before) / mid_before
 
+        return await self._record_trade(
+            market, side, size_usd, avg_price, fee_usd,
+            strategy=strategy, combo_group_id=combo_group_id,
+            slippage_pct=slippage_pct,
+            decision_best_ask=decision_ask, fill_best_ask=fill_ask,
+            shares=shares,
+        )
+
+    async def _record_trade(
+        self,
+        market: Market,
+        side: str,
+        size_usd: float,
+        avg_price: float,
+        fee_usd: float,
+        *,
+        strategy: str,
+        combo_group_id: Optional[str],
+        slippage_pct: float,
+        decision_best_ask: Optional[float],
+        fill_best_ask: Optional[float],
+        shares: float,
+        deduct_balance: bool = True,
+    ) -> Fill:
+        """
+        Record an opened position in the DB + in-memory tracker and return
+        its Fill. Shared by place_order (marketable taker fills — balance is
+        deducted here, total_cost = size + fee) and the sum-to-one maker flow
+        (the maker leg fills at its resting price with ZERO fee; the pair's
+        cash was already reserved at post, so deduct_balance=False prevents
+        double-counting the reservation).
+        """
+        if deduct_balance:
+            self.balance_usd -= size_usd + fee_usd
         trade_id = await self.db.open_trade(
             signal_id=None,
             market_id=market.market_id,
@@ -387,8 +477,8 @@ class PaperBroker:
             strategy=strategy,
             combo_group_id=combo_group_id,
             slippage_pct=slippage_pct,
-            decision_best_ask=decision_ask,
-            fill_best_ask=fill_ask,
+            decision_best_ask=decision_best_ask,
+            fill_best_ask=fill_best_ask,
         )
         self._open_positions.setdefault(market.market_id, []).append(trade_id)
         await self.db.record_equity(mode=self.mode, balance_usd=self.balance_usd)
@@ -397,7 +487,6 @@ class PaperBroker:
             "[PAPER] Filled %s %s $%.2f @ avg %.4f (slippage %.2f%%, fee $%.2f, strategy=%s)",
             side, market.market_id, size_usd, avg_price, slippage_pct * 100, fee_usd, strategy,
         )
-
         return Fill(
             trade_id=trade_id, market_id=market.market_id, side=side,
             avg_price=avg_price, size_usd=size_usd, shares=shares,
@@ -550,6 +639,325 @@ class PaperBroker:
             raise SumToOneEdgeLostError(combined_cost, locked_edge_pct, action=action)
 
         return yes_fill, no_fill
+
+    # --- Sum-to-one MAKER execution (added 2026-08-12) ---------------------
+    # Takers pay rate * p * (1 - p) per share on BOTH legs; MAKERS pay zero
+    # and earn a rebate (20% on crypto). Post the CHEAPER leg as a resting
+    # buy at the bid — its fee fraction of notional (rate * (1 - p)) is the
+    # LARGER of the two, so zeroing its fee saves the most, and bid < ask
+    # makes the entry price strictly better. The instant the maker leg
+    # fills, take the other leg at market. The exposure gap between the legs
+    # is ONE book read, not an open-ended cancel-and-reverse wait (Claude
+    # review 2026-08-12: a both-legs-maker plan reintroduces exactly the
+    # naked-position window the momentum_fallback disaster closed off —
+    # never carry unhedged inventory longer than one round trip).
+
+    async def post_sum_to_one_maker(
+        self, market: Market, total_size_usd: float,
+        book_source: Optional[object] = None,
+    ) -> Optional[MakerOrder]:
+        """
+        Post ONE leg of a sub-$1 YES+NO pair as a resting BUY at the bid.
+        Returns the MakerOrder, or None when this pair can't be posted as a
+        maker right now (no bid on the cheap side, the maker+taker combo no
+        longer locks a profit, or the taker leg's book can't absorb our
+        size) — the caller may fall back to the taker flow.
+
+        The maker leg is the CHEAPER side: its ask is lower, its fee fraction
+        of notional is the larger, so making it the maker saves the most fee.
+        The taker leg (expensive side) is taken at market the instant the
+        maker fills.
+
+        Depth-aware sizing: the size is capped by what the TAKER leg's ask
+        side can actually absorb, because a maker fill MUST be paired — an
+        unpaired fill is a naked directional position. Cash for the full pair
+        (+ estimated taker fee) is RESERVED at post and refunded on cancel;
+        the reservation also counts toward MAX_TOTAL_EXPOSURE_PCT via
+        get_total_exposure_usd().
+        """
+        if self.has_pending_maker(market.market_id):
+            return None
+
+        async def _book(token_id: str) -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        yes_book = await _book(market.token_id_yes)
+        no_book = await _book(market.token_id_no)
+        yes_ask, no_ask = yes_book.best_ask, no_book.best_ask
+        if yes_ask is None or no_ask is None:
+            return None
+
+        # Cheaper side -> maker leg; expensive side -> taken on fill.
+        if yes_ask <= no_ask:
+            maker_side, taker_side = "YES", "NO"
+            maker_book, taker_book = yes_book, no_book
+        else:
+            maker_side, taker_side = "NO", "YES"
+            maker_book, taker_book = no_book, yes_book
+
+        maker_price = maker_book.best_bid
+        taker_ask = taker_book.best_ask
+        if maker_price is None or taker_ask is None or maker_price <= 0:
+            return None
+
+        rate = self._fee_rate_for(market)
+        half = total_size_usd / 2
+
+        # Lock check against the REAL post prices: the maker fills at the
+        # bid, the taker at the ask. The maker leg pays zero fee; only the
+        # taker leg's price-dependent fee applies. Must clear the same
+        # minimum edge as the taker flow.
+        locked_edge_pct = (1.0 - maker_price - taker_ask) - fees.taker_fee_pct(taker_ask, rate)
+        if locked_edge_pct <= settings.SUM_TO_ONE_MIN_EDGE_PCT:
+            return None
+
+        # Depth-aware sizing (Claude review 2026-08-12): the taker leg must
+        # be able to absorb `half` when the maker fills. Refuse to post a
+        # size the other book can't match — an oversized maker fill cannot
+        # be paired and becomes a naked position.
+        try:
+            self._walk_book_for_fill(taker_book, half)
+        except ValueError:
+            return None
+
+        # Reserve cash for the full pair (both legs + estimated taker fee).
+        # Refunded on cancel; adjusted to the actual fee on fill.
+        est_taker_fee = half * fees.taker_fee_fraction_of_notional(taker_ask, rate)
+        reserve = total_size_usd + est_taker_fee
+        if reserve > self.balance_usd:
+            return None
+        self.balance_usd -= reserve
+
+        maker_token_id = market.token_id_yes if maker_side == "YES" else market.token_id_no
+        db_row_id = await self.db.log_maker_order(
+            market_id=market.market_id, side=maker_side, token_id=maker_token_id,
+            price=maker_price, size_usd=half,
+            combo_group_id=None,
+            notes=(
+                f"maker={maker_side}@{maker_price:.3f} taker={taker_side}@ask "
+                f"locked_edge={locked_edge_pct:.2%} pair_total={total_size_usd:.2f}"
+            ),
+        )
+        order = MakerOrder(
+            market=market, market_id=market.market_id,
+            maker_side=maker_side, taker_side=taker_side,
+            maker_price=maker_price, half_size_usd=half,
+            reserve_usd=reserve, posted_at=time.time(), db_row_id=db_row_id,
+        )
+        self._maker_orders[market.market_id] = order
+        logger.info(
+            "[PAPER] Posted sum-to-one maker %s %s $%.2f @ bid %.3f "
+            "(taker leg %s at ask %.3f, locked edge %.2f%%, reserved $%.2f)",
+            maker_side, market.market_id, half, maker_price,
+            taker_side, taker_ask, locked_edge_pct * 100, reserve,
+        )
+        return order
+
+    async def check_sum_to_one_makers(self) -> list[str]:
+        """
+        Advance every resting maker order one cycle (called from the sum-to-
+        one scan BEFORE scanning new opportunities):
+          - timed out          -> cancel (refund reserve, resolve CANCELLED)
+          - filled + lock holds -> immediately take the other leg at market,
+                                   open BOTH legs as a combo (resolve FILLED)
+          - filled + lock gone  -> reverse the maker leg at market (resolve
+                                   REVERSED) — NEVER take a taker leg that
+                                   breaks the lock
+        Returns short action strings for the caller's alert/log.
+        """
+        actions: list[str] = []
+        for market_id, order in list(self._maker_orders.items()):
+            if order.status != "PENDING":
+                self._maker_orders.pop(market_id, None)
+                continue
+            try:
+                action = await self._advance_maker_order(order)
+            except Exception:
+                logger.exception(
+                    "Sum-to-one maker check failed for %s — keeping order pending", market_id,
+                )
+                continue
+            if action:
+                actions.append(action)
+                if order.status != "PENDING":
+                    self._maker_orders.pop(market_id, None)
+        return actions
+
+    async def _advance_maker_order(self, order: MakerOrder) -> Optional[str]:
+        """One cycle of a single PENDING maker order. See check_sum_to_one_makers."""
+        market = order.market
+        rate = self._fee_rate_for(market)
+
+        # (1) Timeout -> cancel and refund.
+        if time.time() - order.posted_at > settings.SUM_TO_ONE_MAKER_TIMEOUT_S:
+            self.balance_usd += order.reserve_usd
+            await self.db.resolve_maker_order(
+                order.db_row_id, status="CANCELLED",
+                notes="timeout — no fill within SUM_TO_ONE_MAKER_TIMEOUT_S",
+            )
+            order.status = "CANCELLED"
+            logger.info(
+                "[PAPER] Sum-to-one maker %s timed out after %.0fs — cancelled, refunded $%.2f",
+                market.market_id, settings.SUM_TO_ONE_MAKER_TIMEOUT_S, order.reserve_usd,
+            )
+            return f"maker_cancelled_timeout {market.market_id}"
+
+        # (2) Fill detection: the resting bid fills when ask-side sellers
+        # cross down to our price (spread collapse / adverse price action).
+        # Partial fills are handled honestly — only the filled portion is
+        # paired, so the pair never exceeds what actually filled.
+        maker_token = market.token_id_yes if order.maker_side == "YES" else market.token_id_no
+        maker_book = await self.feed.get_order_book(market.market_id, maker_token)
+        crossing_shares = sum(
+            lvl.size for lvl in maker_book.asks if lvl.price <= order.maker_price + 1e-9
+        )
+        if crossing_shares <= 0:
+            return None  # still resting
+
+        our_shares = order.half_size_usd / order.maker_price
+        fill_shares = min(our_shares, crossing_shares)
+        fill_usd = fill_shares * order.maker_price
+
+        # (3) The maker filled — immediately take the other leg, but only if
+        # the lock still holds. Quote the taker walk BEFORE opening anything.
+        taker_token = market.token_id_yes if order.taker_side == "YES" else market.token_id_no
+        taker_book = await self.feed.get_order_book(market.market_id, taker_token)
+        try:
+            taker_avg, taker_shares = self._walk_book_for_fill(taker_book, fill_usd)
+        except ValueError:
+            return await self._reverse_maker(
+                order, fill_shares, fill_usd,
+                reason="taker leg book cannot absorb the fill",
+            )
+        taker_avg = _round_to_tick(taker_avg, self.tick_size)
+
+        # The lock is the same computation as post, against the ACTUAL taker
+        # walk: maker leg fee = 0, taker leg pays its price-dependent fee.
+        locked_edge_pct = (1.0 - order.maker_price - taker_avg) - fees.taker_fee_pct(taker_avg, rate)
+        if locked_edge_pct <= 0:
+            # Lock died before the taker leg was taken. Reverse the maker
+            # leg NOW — never take a taker leg that turns a guaranteed
+            # profit into a guaranteed loss. Entry was at the BID, so the
+            # reversal loss is bounded by the spread (strictly smaller than
+            # the taker flow's ask-walk reversal).
+            return await self._reverse_maker(
+                order, fill_shares, fill_usd,
+                reason=(
+                    f"lock broken at fill (maker {order.maker_price:.3f} + "
+                    f"taker walk {taker_avg:.3f})"
+                ),
+            )
+
+        # (4) Lock holds — open BOTH legs as a combo (maker fee = 0), then
+        # refund the unused reservation (estimated vs actual taker fee). The
+        # pair settles normally via settle_position(), like the taker flow's
+        # combos.
+        combo_group_id = str(uuid.uuid4())
+        maker_fee = 0.0
+        taker_fee = fill_usd * fees.taker_fee_fraction_of_notional(taker_avg, rate)
+        await self._record_trade(
+            market, order.maker_side, fill_usd, order.maker_price, maker_fee,
+            strategy="sum_to_one", combo_group_id=combo_group_id,
+            slippage_pct=0.0, decision_best_ask=order.maker_price,
+            fill_best_ask=order.maker_price, shares=fill_shares,
+            deduct_balance=False,
+        )
+        await self._record_trade(
+            market, order.taker_side, fill_usd, taker_avg, taker_fee,
+            strategy="sum_to_one", combo_group_id=combo_group_id,
+            slippage_pct=0.0, decision_best_ask=taker_book.best_ask,
+            fill_best_ask=taker_avg, shares=taker_shares,
+            deduct_balance=False,
+        )
+        actual_cost = fill_usd + fill_usd + taker_fee  # maker + taker legs + taker fee
+        self.balance_usd += order.reserve_usd - actual_cost
+
+        await self.db.resolve_maker_order(
+            order.db_row_id, status="FILLED",
+            filled_price=order.maker_price, taker_leg_price=taker_avg,
+            combined_cost=order.maker_price + taker_avg, taker_fee_usd=taker_fee,
+            notes=f"paired as combo {combo_group_id}",
+        )
+        order.status = "FILLED"
+        logger.info(
+            "[PAPER] Sum-to-one maker %s filled @ %.3f -> took %s @ %.3f: pair cost %.3f "
+            "(locked edge %.2f%%), combo %s",
+            market.market_id, order.maker_price, order.taker_side, taker_avg,
+            order.maker_price + taker_avg, locked_edge_pct * 100, combo_group_id,
+        )
+        return f"maker_paired {market.market_id} (edge {locked_edge_pct:.2%})"
+
+    async def _reverse_maker(
+        self, order: MakerOrder, fill_shares: float, fill_usd: float, reason: str,
+    ) -> str:
+        """
+        The maker leg filled but the pair can't be completed safely. Sell
+        the filled shares at market immediately — one round trip of exposure,
+        never an open-ended naked position. The maker entered at the BID, so
+        the reversal loss is bounded by the spread.
+
+        Cash: the full pair was reserved at post; refund the reservation,
+        then apply the maker leg's own P&L (paid fill_usd, received the bid-
+        side walk net of exit fee).
+        """
+        market = order.market
+        rate = self._fee_rate_for(market)
+        maker_token = market.token_id_yes if order.maker_side == "YES" else market.token_id_no
+        book = await self.feed.get_order_book(market.market_id, maker_token)
+        price, filled = self._walk_book_for_sale(book, fill_shares)
+        if filled <= 0 or filled < fill_shares - 1e-9:
+            # Cannot exit the FULL position (no depth or partial only) — the
+            # position rides to settlement as a directional hold. Recorded
+            # loudly: this is the same class of residual risk the taker
+            # flow's half-open-leg fallback has. The maker leg IS recorded
+            # as a real (unpaired) trade so its settlement P&L is realized
+            # honestly instead of vanishing; the maker_orders row is marked
+            # HELD to keep the audit trail. Cash: the reservation minus the
+            # fill cost is refunded (the fill itself paid fill_usd); the
+            # trade is opened with deduct_balance=False since that cash is
+            # already accounted for.
+            logger.warning(
+                "[PAPER] Sum-to-one maker %s fill could NOT be reversed (%s) — "
+                "bid side absorbs only %.2f of %.2f shares; holding %s %.2f shares to settlement",
+                market.market_id, reason, filled, fill_shares, order.maker_side, fill_shares,
+            )
+            self.balance_usd += order.reserve_usd - fill_usd
+            await self._record_trade(
+                market, order.maker_side, fill_usd, order.maker_price, 0.0,
+                strategy="sum_to_one", combo_group_id=None,
+                slippage_pct=0.0, decision_best_ask=order.maker_price,
+                fill_best_ask=order.maker_price, shares=fill_shares,
+                deduct_balance=False,
+            )
+            await self.db.resolve_maker_order(
+                order.db_row_id, status="HELD", filled_price=order.maker_price,
+                notes=f"{reason}; bid depth absorbs {filled:.2f}/{fill_shares:.2f} shares — held to settlement",
+            )
+            order.status = "HELD"
+            return f"maker_held_to_settlement {market.market_id}"
+
+        proceeds = filled * price
+        exit_fee = proceeds * fees.taker_fee_fraction_of_notional(price, rate)
+        net_proceeds = proceeds - exit_fee
+        self.balance_usd += order.reserve_usd - fill_usd + net_proceeds
+        await self.db.resolve_maker_order(
+            order.db_row_id, status="REVERSED", filled_price=order.maker_price,
+            notes=(
+                f"{reason}; sold {filled:.2f} shares @ {price:.3f} "
+                f"(net ${net_proceeds:.2f})"
+            ),
+        )
+        order.status = "REVERSED"
+        logger.info(
+            "[PAPER] Sum-to-one maker %s reversed after fill (%s): sold %.2f shares "
+            "@ %.3f, net $%.2f",
+            market.market_id, reason, filled, price, net_proceeds,
+        )
+        return f"maker_reversed {market.market_id}"
 
     async def _quote_sum_to_one_fills(
         self, market: Market, half_size_usd: float, book_source: Optional[object],
