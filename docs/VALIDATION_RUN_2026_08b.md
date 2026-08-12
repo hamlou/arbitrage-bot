@@ -213,6 +213,27 @@ builds the instrument that measures that gap, changes NO thresholds:
 Freeze status: unchanged. All additions; `settings.py` diff is pure additions
 (zero deletions) — no frozen threshold was touched. 474 tests pass.
 
+### 2026-08-12 — Discovery-dry alert sensitivity fix (infrastructure, allowed
+under the freeze)
+
+User reported the 🚨 CRITICAL "Discovery found 0 markets" alert firing
+repeatedly. Investigated live rather than theorized:
+
+- The bot's OWN discovery code found **4 live BTC/ETH 5-min windows right
+  now** (liq $3.6k–$16.8k) while the alert was firing — discovery works.
+- Gamma genuinely serves empty slices intermittently: the SAME keyset query
+  returned 0 events one minute and 100 events (live August-2026 windows) the
+  next. Verified twice.
+- Root cause: `DISCOVERY_EMPTY_ALERT_AFTER_PASSES = 3` (3 passes × 3s ≈ 9
+  seconds) — far too sensitive for an API that blips empty for a minute or
+  two. Every transient blip screamed CRITICAL.
+
+Fix: raised to **60 passes (≈3 min of sustained emptiness)** — filters the
+blips while still catching a real outage before the 5-min windows expire with
+no replacements. No trading logic touched; the wipe-on-empty protection
+(keep last-known markets + WS subscriptions) is unchanged. 63 tests pass on
+the affected files; full suite 474.
+
 ---
 
 *Continue logging every intervention below — a run with a documented human

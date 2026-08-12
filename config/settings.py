@@ -300,12 +300,23 @@ class Settings(BaseSettings):
     # Discovery-dry tolerance: Gamma intermittently serves stale cached slices
     # that contain NO live windows at all (verified live 2026-08-11 — 0 live
     # BTC/ETH windows across 40 paginated pages while the API status page said
-    # "operational"). When a pass returns zero markets we must NOT wipe the
-    # known universe (that empties the WS subscription, which flips the feed-
-    # health gate to unhealthy, which halts trading) — see main.py. After this
-    # many CONSECUTIVE empty discovery passes, alert Telegram instead of
-    # silently idling. 3 passes x 3s interval = ~9s before the first alert.
-    DISCOVERY_EMPTY_ALERT_AFTER_PASSES: int = 3
+    # "operational"; re-verified 2026-08-12 — the SAME query returned 0 events
+    # one minute and 100 events the next). When a pass returns zero markets we
+    # must NOT wipe the known universe (that empties the WS subscription,
+    # which flips the feed-health gate to unhealthy, which halts trading) —
+    # see main.py. After this many CONSECUTIVE empty discovery passes, alert
+    # Telegram instead of silently idling.
+    #
+    # Raised 3 -> 60 on 2026-08-12: at 3 passes (x 3s = ~9s) the CRITICAL
+    # alert fired on every transient Gamma blip — alert fatigue that read as
+    # "the bot is broken" when discovery was actually recovering a second
+    # later (live-verified: the bot's own discovery found 4 live BTC/ETH
+    # 5-min windows while the alert was still firing). 60 passes x 3s = 3
+    # minutes of SUSTAINED emptiness before CRITICAL — long enough to be a
+    # real outage, short enough that the 5-min windows (which expire in a
+    # couple of minutes with no replacements) haven't silently emptied the
+    # universe. The bot keeps trading off last-known markets meanwhile.
+    DISCOVERY_EMPTY_ALERT_AFTER_PASSES: int = 60
 
     # --- Liquidity threshold (lowered 50k -> 5k on 08-04, -> 1k on 08-06) --
     # Verified live 2026-08-06: Gamma's `liquidity` field is NOT reliable —
