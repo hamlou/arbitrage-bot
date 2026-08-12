@@ -203,6 +203,10 @@ def _ms(v: Optional[float]) -> str:
     return f"{v:.0f}ms" if v is not None else "—"
 
 
+def _secs(v: Optional[float]) -> str:
+    return f"{v:.1f}s" if v is not None else "—"
+
+
 def format_report(s: dict[str, Any]) -> str:
     lines = [
         "=" * 72,
@@ -219,7 +223,7 @@ def format_report(s: dict[str, Any]) -> str:
         "EXECUTION quality:",
         f"  median tick -> order       : {_ms(s['median_tick_to_order_ms'])}   "
         f"(arbitrage window ~2s; platform taker delay +250ms)",
-        f"  avg Polymarket book age    : {s['avg_book_age_s']}s   "
+        f"  avg Polymarket book age    : {_secs(s['avg_book_age_s'])}   "
         f"(WS treats <5s as fresh; entry on a 4.5s-old book is stale)",
         f"  avg fill slippage          : {_pct(s['avg_slippage_pct'])}",
         "",
