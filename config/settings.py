@@ -177,6 +177,16 @@ class Settings(BaseSettings):
     # otherwise leave reference_price unset so fair-value stays off and the
     # calibrated momentum fallback (honestly ~52%) refuses to invent an edge.
     REFERENCE_TRUST_MIN_REMAINING_PCT: float = 0.60
+    # Whether the momentum heuristic/calibration fallback may fire ENTRY
+    # signals when the fair-value model has no inputs (no reference price or
+    # volatility estimate). Verified live 2026-08-11: this fallback is a coin
+    # flip — it fires with ZERO knowledge of the market's reference price, and
+    # ALL THREE full-stake SETTLED-at-zero losses (−$67, −$85, −$77 = −$229)
+    # came from momentum_fallback entries (3W/3L, −$173 net) while fair-value
+    # trades were 7W/2L (+$33 net). The bot is a gap founder, not a gambler:
+    # no reference -> no entry. Keep False unless out-of-sample data shows the
+    # fallback is profitable.
+    ALLOW_MOMENTUM_FALLBACK_ENTRIES: bool = False
 
     # --- Exit logic -----------------------------------------------------
     # Early take-profit: exit if the position's current mark-to-market value

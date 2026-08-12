@@ -24,7 +24,14 @@ from storage.db import Database
 
 
 def make_settings(**overrides) -> Settings:
-    defaults = dict(EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000)
+    # These tests drive the cross-exchange GATE through fake feeds with only
+    # 1-2 ticks each — too few for the fair-value volatility estimator, so
+    # they reach the momentum fallback. Enabled here deliberately so the gate
+    # itself (not the fallback gate) is what's under test.
+    defaults = dict(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
+    )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)
 

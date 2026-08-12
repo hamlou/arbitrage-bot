@@ -421,8 +421,30 @@ class SignalEngine:
                 model_used = "momentum_fallback"
                 direction_ok = True
 
+        # 2026-08-12 gate (measured, not guessed): the momentum fallback is a
+        # coin flip — it fires with ZERO knowledge of the market's reference
+        # price, and the code's own calibration doc says it is "honestly
+        # ~52%". Live data confirmed the worst case: ALL THREE full-stake
+        # SETTLED-at-zero losses (−$67, −$85, −$77) came from momentum_fallback
+        # entries (3W/3L, −$173 net) while fair-value trades were 7W/2L
+        # (+$33 net). When the gate is off (default), a fallback-only read is
+        # discarded and the signal becomes "insufficient data" — which never
+        # fires. The bot is a gap founder, not a gambler: no reference price
+        # -> no entry.
+        fallback_gated = (
+            model_used == "momentum_fallback"
+            and not self.settings.ALLOW_MOMENTUM_FALLBACK_ENTRIES
+        )
+        if fallback_gated:
+            implied_prob = None
+
         if implied_prob is None or polymarket_prob is None:
-            reason = "insufficient data (no fair-value inputs and no confirmed momentum yet)"
+            reason = (
+                "momentum fallback disabled for entries — no fair-value inputs "
+                "(missing reference price or volatility), refusing to trade blind"
+                if fallback_gated
+                else "insufficient data (no fair-value inputs and no confirmed momentum yet)"
+            )
             sig = Signal(
                 market=market, side="", implied_prob=0.0, polymarket_prob=polymarket_prob or 0.0,
                 edge_pct=0.0, confidence=0.0, fired=False, reason=reason, model_used=model_used,

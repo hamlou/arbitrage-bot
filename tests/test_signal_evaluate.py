@@ -72,7 +72,9 @@ async def test_uses_fair_value_model_when_reference_price_available(db):
 
 
 async def test_falls_back_to_momentum_without_reference_price(db):
-    settings = make_settings()
+    # The fallback path still exists for explicit opt-in (backtest/replay);
+    # this test enables it to keep the machinery itself covered.
+    settings = make_settings(ALLOW_MOMENTUM_FALLBACK_ENTRIES=True)
     engine = SignalEngine(settings, db)
 
     prices = [100, 101, 102]  # confirmed UP direction for the momentum fallback
@@ -95,9 +97,9 @@ async def test_fallback_fires_on_net_momentum_with_oscillating_ticks(db):
     trade-by-trade BTC data almost never produces (66% of 16,019 live signals
     died with "insufficient data", 0 directional trades in 20.7h). Oscillating
     ticks with a NET upward drift must now reach the fallback via the sign of
-    the net window momentum.
+    the net window momentum. Explicitly enabled here to cover the machinery.
     """
-    settings = make_settings(EDGE_THRESHOLD_PCT=0.01, MIN_CONFIDENCE=0.2)
+    settings = make_settings(EDGE_THRESHOLD_PCT=0.01, MIN_CONFIDENCE=0.2, ALLOW_MOMENTUM_FALLBACK_ENTRIES=True)
     engine = SignalEngine(settings, db)
 
     # Up/down/up/down — direction_confirmed() is None (no 3 consecutive same-
@@ -210,10 +212,11 @@ async def test_allows_entry_when_ask_below_max_directional_entry_price(db):
     """A reasonable ask with a non-degenerate model read must still be allowed
     to fire — the cap and the saturation guard are guardrails, not a kill
     switch. Uses the momentum fallback (no reference price) so the read stays
-    inside the sane band."""
+    inside the sane band. Fallback explicitly enabled for this test."""
     settings = make_settings(
         EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
         MAX_DIRECTIONAL_ENTRY_PRICE=0.80, TAKER_FEE_PCT=0.02,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
     )
     engine = SignalEngine(settings, db)
 
@@ -232,10 +235,11 @@ async def test_edge_gate_is_fee_aware(db):
     """The raw model-vs-market gap must clear the taker fee before it counts as
     an edge — otherwise the "edge" is entirely consumed by fees. Uses a
     non-degenerate momentum read with aligned direction so only the fee gate
-    can be the blocker."""
+    can be the blocker. Fallback explicitly enabled for this test."""
     settings = make_settings(
         EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
         MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.04,  # high fee on purpose
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
     )
     engine = SignalEngine(settings, db)
 
@@ -296,13 +300,16 @@ async def test_large_edge_bypasses_fresh_move_magnitude_floor(db):
         EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
         MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
         FRESH_MOVE_LARGE_EDGE_BYPASS_PCT=0.12,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
     )
     engine = SignalEngine(settings, db)
 
     # Big downward move (64000 -> 62000, ~3%), market priced at 0.55 — the
     # model leans NO hard (implied NO ~0.90+, edge >> 0.12). Then a tiny
     # continued drift DOWN (62000 -> 61980) so the 15s move is aligned in
-    # direction but below FRESH_MOVE_MIN_PCT in magnitude.
+    # direction but below FRESH_MOVE_MIN_PCT in magnitude. (Fewer than the
+    # 8-tick volatility minimum, so this exercises the fallback path — hence
+    # the explicit enable above.)
     feed_ticks(engine, [64000, 63000, 62000, 61990, 61980])
     market = make_market(reference_price=64000, expires_at_ts=time.time() + 300)
     yes_book = make_book("tok_yes", 0.54, 0.56)
@@ -342,10 +349,12 @@ async def test_large_edge_still_blocks_when_direction_opposes(db):
 async def test_blocks_entry_when_window_almost_over(db):
     """Even with a genuine aligned move, entering in the final seconds of a
     window is a noise trade — the market has effectively decided. Must not
-    fire."""
+    fire. Fallback explicitly enabled so the time-remaining gate is what's
+    tested, not the fallback gate."""
     settings = make_settings(
         EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
         MAX_DIRECTIONAL_ENTRY_PRICE=0.95, TAKER_FEE_PCT=0.02,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
     )
     engine = SignalEngine(settings, db)
 
@@ -385,6 +394,52 @@ async def test_implied_probability_clamped_and_blocks_saturated_read(db):
 
 
 # -- exit-check recompute without logging -----------------------------------
+
+# -- momentum fallback gate (2026-08-12) --------------------------------------
+# Live 2026-08-11 data: all three full-stake SETTLED-at-zero losses came from
+# momentum_fallback entries (no reference price = pure guess). By default the
+# fallback must NOT fire entries — only the fair-value model (real reference +
+# volatility) may trade.
+
+
+async def test_momentum_fallback_gated_off_by_default(db):
+    """No reference price -> fair value impossible. The momentum fallback
+    would have produced a read, but with ALLOW_MOMENTUM_FALLBACK_ENTRIES=False
+    (default) the signal must NOT fire and must explain why."""
+    settings = make_settings()  # default: fallback gated off
+    engine = SignalEngine(settings, db)
+
+    prices = [100, 101, 102]  # confirmed UP direction
+    feed_ticks(engine, prices)
+
+    market = make_market(reference_price=None)  # no reference price captured
+    yes_book = make_book("tok_yes", 0.50, 0.52)
+    no_book = make_book("tok_no", 0.48, 0.50)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.fired is False
+    assert signal.model_used == "momentum_fallback"  # audit trail still tags it
+    assert "momentum fallback disabled" in signal.reason
+
+
+async def test_momentum_fallback_gate_still_blocks_with_big_edge(db):
+    """Even a large fallback edge must not fire while the gate is off — a
+    big edge on a no-reference read is a bigger gamble, not a better one."""
+    settings = make_settings(EDGE_THRESHOLD_PCT=0.01, MIN_CONFIDENCE=0.2)
+    engine = SignalEngine(settings, db)
+
+    # Strong net upward momentum -> fallback implied prob well above 0.5.
+    prices = [100.0, 100.8, 100.4, 101.2, 100.8, 101.6, 101.2, 102.0]
+    feed_ticks(engine, prices)
+
+    market = make_market(reference_price=None)
+    yes_book = make_book("tok_yes", 0.45, 0.47)  # market well below model -> large edge
+    no_book = make_book("tok_no", 0.51, 0.53)
+
+    signal = await engine.evaluate(market, yes_book, no_book)
+    assert signal.fired is False
+    assert "momentum fallback disabled" in signal.reason
+
 
 async def test_log_false_does_not_write_to_signals_table(db):
     settings = make_settings()

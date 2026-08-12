@@ -51,6 +51,7 @@ GATE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ("edge_threshold", ("net edge",)),
     ("min_confidence", ("confidence",)),
     ("insufficient_data", ("insufficient data",)),
+    ("fallback_gated", ("momentum fallback disabled",)),
     ("cross_exchange", ("cross_exchange_disagreement",)),
     ("other", ()),
 ]

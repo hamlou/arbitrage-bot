@@ -450,9 +450,13 @@ class TradingApp:
                             or remaining < duration_s * settings.REFERENCE_TRUST_MIN_REMAINING_PCT
                         ):
                             # Leave reference_price unset -> fair-value stays
-                            # off; the calibrated momentum fallback (honestly
-                            # ~52%) will refuse to invent an edge on stale
-                            # inputs, so no phantom trade fires.
+                            # off. The momentum fallback (honestly ~52%) is now
+                            # gated off for entries by default
+                            # (ALLOW_MOMENTUM_FALLBACK_ENTRIES=False, added
+                            # 2026-08-12 after ALL THREE full-stake
+                            # SETTLED-at-zero losses came from fallback
+                            # entries), so a market with no trusted reference
+                            # simply does not trade — no phantom entry fires.
                             logger.debug(
                                 "Late or unknown first sighting of %s (%s) — "
                                 "reference price not trusted, fair-value stays off",

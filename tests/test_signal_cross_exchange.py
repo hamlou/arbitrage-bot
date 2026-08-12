@@ -20,7 +20,13 @@ from storage.db import Database
 
 
 def make_settings(**overrides) -> Settings:
-    defaults = dict(EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000)
+    # These tests exercise the cross-exchange GATE, which only matters when a
+    # signal could otherwise fire. The momentum fallback is the only path that
+    # fires without a reference price, so it's enabled here deliberately.
+    defaults = dict(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
+    )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)
 
