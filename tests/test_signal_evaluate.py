@@ -231,6 +231,42 @@ async def test_allows_entry_when_ask_below_max_directional_entry_price(db):
     assert signal.fired is True
 
 
+async def test_default_cap_blocks_coinflip_zone_entries(db):
+    """
+    FREEZE OVERRIDE 2026-08-13 (user-directed, logged in the validation doc):
+    the live record since the 0.58 cap landed is 6 trades, and ALL FOUR
+    entries at >= 0.50 lost (0.50/0.50/0.52/0.54 -> -$172.5 net, 0 wins) while
+    the 0.27 entries went 1W/1L. At p~0.5 the contract sits at maximum
+    uncertainty with minimum relative mispricing and the fee at its dollar
+    peak — the model's weakest edge exactly where losses are worst. The
+    DEFAULT cap (0.45, untouched by this test) must block a 0.50 ask yet
+    still allow a 0.44 ask, so the historical winner zone (avg entry 0.39)
+    stays fully tradable.
+    """
+    settings = make_settings(
+        EDGE_THRESHOLD_PCT=0.05, MIN_CONFIDENCE=0.3, MIN_MARKET_LIQUIDITY_USD=50_000,
+        TAKER_FEE_PCT=0.02,
+        ALLOW_MOMENTUM_FALLBACK_ENTRIES=True,
+    )  # MAX_DIRECTIONAL_ENTRY_PRICE intentionally left at its live default
+    engine = SignalEngine(settings, db)
+
+    # Moderate confirmed upward momentum -> implied ~0.66, not saturated.
+    feed_ticks(engine, [100, 101, 102])
+    market = make_market(reference_price=None)
+
+    # 0.50 ask: the max-fee coin-flip zone — blocked by the default cap.
+    yes_book_050 = make_book("tok_yes", 0.48, 0.50)
+    no_book = make_book("tok_no", 0.48, 0.50)
+    signal = await engine.evaluate(market, yes_book_050, no_book)
+    assert signal.fired is False
+    assert "max" in signal.reason  # blocked specifically by the price cap
+
+    # 0.44 ask: inside the allowed zone — must still fire.
+    yes_book_044 = make_book("tok_yes", 0.42, 0.44)
+    signal2 = await engine.evaluate(market, yes_book_044, no_book)
+    assert signal2.fired is True
+
+
 async def test_edge_gate_is_fee_aware(db):
     """The raw model-vs-market gap must clear the taker fee before it counts as
     an edge — otherwise the "edge" is entirely consumed by fees. Uses a

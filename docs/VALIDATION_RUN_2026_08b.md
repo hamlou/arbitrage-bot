@@ -234,6 +234,57 @@ no replacements. No trading logic touched; the wipe-on-empty protection
 (keep last-known markets + WS subscriptions) is unchanged. 63 tests pass on
 the affected files; full suite 474.
 
+### 2026-08-13 — Loss-cluster fix (FREEZE OVERRIDE — user-directed, logged
+here per the freeze rule's own terms: interventions that change thresholds
+must be documented or the run is untrustworthy)
+
+User: "look at the last trade.. the bot still losing too much.. that's not a
+profitable bot! find a solution!!". Pulled the full live record (6 closed
+trades, −$206.92, 1W/5L) and decomposed it by entry price and excursion:
+
+| # | Entry | MFE (best executable) | Exit | PnL |
+|---|-------|----------------------|------|-----|
+| 1 | ETH NO 0.54 | +6.8% (below its 7.4% fee hurdle — no profitable exit ever existed) | SETTLED @ 0 | −$82.58 |
+| 2 | BTC NO 0.27 | −6.5% (never went green) | SETTLED @ 0 (540s hold) | −$36.69 |
+| 3 | BTC YES 0.27 | +13.9% (MAE −33% before recovering) | REPRICE @ 26.6s | +$2.28 |
+| 4 | BTC NO 0.50 | −2% (never green) | GAP_EXPIRED @ 41s @ 0.01 | −$71.80 |
+| 5 | BTC NO 0.50 | −2% | GAP_EXPIRED @ 42s @ 0.44 | −$11.68 |
+| 6 | BTC YES 0.52 | −2.7% | GAP_EXPIRED @ 41s @ 0.50 | −$6.46 |
+
+**The finding is a coin-flip zone, not a model bug.** All FOUR entries at
+≥ 0.50 (trades 1/4/5/6) lost — **−$172.5, zero wins** — while the 0.27
+entries went 1W/1L. That's the mechanism, not luck: at p~0.5 the contract
+sits at maximum uncertainty with minimum relative mispricing (nothing to be
+right about that isn't a coin flip) and the fee at its dollar peak; ZERO
+wins have ever come from an entry ≥ 0.50 in this project's entire record,
+and the 79-market study already showed losers avg 0.57 vs winners 0.39.
+GAP_EXPIRED works when it has data (caught 5 & 6 at −12%/−4%) but trade 4
+collapsed to 0.01 inside 41s, and trade 2 predated any reprice stats so it
+rode 540s to settlement.
+
+Two changes (this is the LAST threshold change until the 100+ trade bar):
+
+1. **`MAX_DIRECTIONAL_ENTRY_PRICE` 0.58 → 0.45** — the 0.50 coin-flip zone
+   is simply not tradable. Clears the max-fee point with margin while
+   keeping the historical winner zone (avg 0.39) fully tradable. Touches
+   zero winners by construction: no win in the record has ever entered
+   ≥ 0.50. The signal gate continues logging every blocked entry.
+2. **`NO_PROGRESS_HOLD_S = 120.0` + `NO_PROGRESS` exit** — the stats-free
+   backstop for the never-green loser class: if a position's walked
+   executable bid has NEVER crossed above entry (MFE < 0) after 120s
+   (4.4× the ~27s median reprice hold), the predicted convergence never
+   materialized — exit instead of riding to settlement at 0. The MFE<0
+   guard means a trade that ever went green is never touched (the winner
+   that dipped −33% before recovering stays protected). Covers assets with
+   no reprice stats yet where GAP_EXPIRED can't fire. Also added to the
+   early-exit premature/protective classification in the digest.
+
+Both changes re-use data the bot already tracks (entry price, MFE/MAE from
+the walked executable bid); no new strategy, no frozen value besides the cap
+itself. 477 tests pass (3 new: cap blocks a 0.50 ask / allows 0.44;
+NO_PROGRESS fires on a never-green aged position; never fires on a trade
+that went green).
+
 ---
 
 *Continue logging every intervention below — a run with a documented human

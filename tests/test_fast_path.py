@@ -178,6 +178,9 @@ async def test_big_move_triggers_fast_path_and_opens_position(app_settings):
 
         now = _warm_tracker(app, 65000.0)
         market = make_market(reference_price=65000)
+        # Arm-phase books at ~50/50: with price == reference there is no edge,
+        # so the no-op ticks below genuinely don't trade. (The jump phase
+        # swaps in cheap books — see below.)
         yes_book = make_book(market.token_id_yes, 0.49, 0.51)
         no_book = make_book(market.token_id_no, 0.49, 0.51)
         app.feed.register(market, yes_book, no_book)
@@ -191,6 +194,19 @@ async def test_big_move_triggers_fast_path_and_opens_position(app_settings):
             tick = PriceUpdate(symbol="BTCUSDT", price=px, event_time_ms=0, received_at=ts, kind="trade")
             app.signal_engine.ingest_price_update(tick, source="binance")
             await app._maybe_fast_path(tick)
+
+        # The jump finds Polymarket still stale: swap the books to one where
+        # the YES ask sits below the 0.45 MAX_DIRECTIONAL_ENTRY_PRICE default
+        # (entry allowed) and NO is priced high (pair sums >= $1, so no
+        # sum-to-one interferes) — this test is about the fast path, not the cap.
+        cheap_yes = make_book(market.token_id_yes, 0.39, 0.41)
+        dear_no = make_book(market.token_id_no, 0.59, 0.61)
+        app.feed.books[market.token_id_yes] = cheap_yes
+        app.feed.books[market.token_id_no] = dear_no
+        app.ws_feed._books[market.token_id_yes] = cheap_yes
+        app.ws_feed._books[market.token_id_no] = dear_no
+        app.ws_feed._last_update_at[market.token_id_yes] = time.time()
+        app.ws_feed._last_update_at[market.token_id_no] = time.time()
 
         # A real move: +1.5% in a ~1.5s burst — price is now well above the
         # reference while Polymarket still shows ~50/50. The fast path must
@@ -231,8 +247,11 @@ async def test_live_mode_fast_path_never_passes_book_source(app_settings):
 
         now = _warm_tracker(app, 65000.0)
         market = make_market(reference_price=65000)
-        yes_book = make_book(market.token_id_yes, 0.49, 0.51)
-        no_book = make_book(market.token_id_no, 0.49, 0.51)
+        # Books below the 0.45 MAX_DIRECTIONAL_ENTRY_PRICE default so the fast
+        # path's entry is allowed (this test is about the live/paper kwarg, not
+        # the cap).
+        yes_book = make_book(market.token_id_yes, 0.39, 0.41)
+        no_book = make_book(market.token_id_no, 0.39, 0.41)
         app.feed.register(market, yes_book, no_book)
         app._known_markets[market.market_id] = market
         _seed_ws_cache(app, market, yes_book, no_book)

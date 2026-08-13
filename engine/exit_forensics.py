@@ -125,7 +125,7 @@ def build_digest_summary(
     closed = [t for t in all_trades if t.get("status") == "CLOSED"]
     classification = classify_early_exits(
         closed, probes, reprice_target,
-        exit_reasons=("EDGE_REVERSAL", "GAP_EXPIRED"),
+        exit_reasons=("EDGE_REVERSAL", "GAP_EXPIRED", "NO_PROGRESS"),
     )
 
     # Days elapsed + distinct trading days: same logic validate_paper_run.py

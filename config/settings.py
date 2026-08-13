@@ -97,7 +97,18 @@ class Settings(BaseSettings):
     # just under the historical loser average (0.57) with margin; the signal
     # gate logs every blocked entry (reason=entry ask > max), so the forward
     # record will judge this — re-evaluate at 100+ trades, do NOT tune before.
-    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.58
+    # Lowered 0.58 -> 0.45 on 2026-08-13 (FREEZE OVERRIDE — user-directed,
+    # logged in docs/VALIDATION_RUN_2026_08b.md): the forward record since
+    # the 0.58 cap landed is 6 trades, and ALL FOUR entries at >= 0.50 lost
+    # (0.50/0.50/0.52/0.54 -> -$172.5 net, 0 wins) while the 0.27 entries
+    # went 1W/1L. That matches the mechanism, not luck: at p~0.5 the contract
+    # sits at maximum uncertainty with minimum relative mispricing (nothing
+    # to be right about that isn't a coin flip) and the fee is at its dollar
+    # peak — the model has its weakest edge exactly where losses are worst,
+    # and ZERO wins have ever come from an entry >= 0.50 in this project's
+    # entire record. 0.45 clears the 0.50 max-fee zone with margin while
+    # keeping the historical winner zone (avg entry 0.39) fully tradable.
+    MAX_DIRECTIONAL_ENTRY_PRICE: float = 0.45
     # Polymarket's crypto taker fee RATE — NOT a flat fraction. The per-share
     # fee is fee_rate * p * (1 - p); as a fraction of what you spend that is
     # fee_rate * (1 - p) per side (~3.5% of notional at p=0.50, ~1.5% at
@@ -277,6 +288,19 @@ class Settings(BaseSettings):
     # trade bar like any other threshold.
     GAP_EXIT_MULTIPLIER: float = 1.5
     GAP_EXIT_MIN_HOLD_S: float = 30.0
+    # No-progress exit (added 2026-08-13): if a position has NEVER once
+    # traded above entry (MFE < 0 — the walked executable bid never crossed
+    # entry) after NO_PROGRESS_HOLD_S, the model's predicted convergence
+    # never materialized at all — exit instead of riding to settlement at 0.
+    # GAP_EXPIRED covers the "didn't reprice in time" case but only once an
+    # asset has closed REPRICE winners to measure a median; this is the
+    # stats-free backstop for the never-green loser class (live 2026-08-13: a
+    # BTC NO @ 0.27 that never went positive was held 540s to settlement at 0
+    # -> -$36.69; three more never-green trades lost -$90). REPRICE winners
+    # close in ~27s median (the live win repriced within 26.6s), so a 120s
+    # (4.4x median) never-green hold is a dead trade, not a slow one — and
+    # the MFE<0 guard means a trade that ever crossed entry is never touched.
+    NO_PROGRESS_HOLD_S: float = 120.0
 
     # --- Sum-to-one maker execution (added 2026-08-12) ------------------
     # Takers pay the price-dependent fee (rate * p * (1 - p) per share);

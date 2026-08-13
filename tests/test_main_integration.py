@@ -360,8 +360,12 @@ async def test_full_pipeline_places_a_trade_on_a_clear_edge(app_settings):
 
         market = make_market(reference_price=65000)
         # Polymarket still pricing near 50/50 -- hasn't caught up to the move.
-        yes_book = make_book(market.token_id_yes, 0.49, 0.51)
-        no_book = make_book(market.token_id_no, 0.49, 0.51)
+        # (YES sits below the 0.45 MAX_DIRECTIONAL_ENTRY_PRICE default so the
+        # entry is allowed; NO is priced high so YES+NO sums >= $1 and the
+        # sum-to-one scan does NOT also fire. The point of this test is the
+        # pipeline, not the entry cap.)
+        yes_book = make_book(market.token_id_yes, 0.39, 0.41)
+        no_book = make_book(market.token_id_no, 0.59, 0.61)
         app.feed.register(market, yes_book, no_book)
         app._known_markets[market.market_id] = market
 
@@ -442,8 +446,11 @@ async def test_trading_cycle_proceeds_when_feeds_healthy(app_settings):
                 PriceUpdate(symbol="BTCUSDT", price=price, event_time_ms=0, received_at=now + i, kind="trade")
             )
         market = make_market(reference_price=65000)
-        yes_book = make_book(market.token_id_yes, 0.49, 0.51)
-        no_book = make_book(market.token_id_no, 0.49, 0.51)
+        # YES below the 0.45 entry cap so the entry is allowed; NO priced high
+        # so the pair sums >= $1 and sum-to-one does not also fire (this test
+        # is about feed health gating, not the entry-price cap).
+        yes_book = make_book(market.token_id_yes, 0.39, 0.41)
+        no_book = make_book(market.token_id_no, 0.59, 0.61)
         app.feed.register(market, yes_book, no_book)
         app._known_markets[market.market_id] = market
 
@@ -587,11 +594,13 @@ async def test_edge_reversal_respects_min_hold(app_settings):
         open_trades = await app.db.get_open_trades(mode="PAPER")
         assert len(open_trades) == 1  # still held despite the model flip
 
-        # Now age the position beyond the min-hold and re-check: the same
-        # model read must now be allowed to reverse it.
+        # Now age the position past EDGE_REVERSAL_MIN_HOLD_S (60s) but stay
+        # under NO_PROGRESS_HOLD_S (120s): this test isolates the reversal
+        # rule, and a never-green position at >= 120s is now legitimately cut
+        # by the no-progress exit first (added 2026-08-13).
         await app.db._conn.execute(
             "UPDATE trades SET entry_ts = ? WHERE id = ?",
-            (now - 120, fill.trade_id),
+            (now - 90, fill.trade_id),
         )
         await app._check_early_exits(equity=1000)
         closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
@@ -723,6 +732,89 @@ async def test_mfe_mae_recorded_on_reprice_close(app_settings):
         await app.db.close()
 
 
+async def test_no_progress_exit_cuts_never_green_position(app_settings):
+    """
+    No-progress exit (added 2026-08-13, freeze-override batch): a position
+    whose walked executable bid has NEVER once crossed above entry (MFE < 0)
+    after NO_PROGRESS_HOLD_S is a dead trade, not a slow one — the model's
+    predicted convergence never materialized at all. Live 2026-08-13: a BTC
+    NO @ 0.27 that never went positive was held 540s to settlement at 0
+    (-> -$36.69) because no reprice stats existed yet for GAP_EXPIRED to
+    fire. This rule is the stats-free backstop for that exact class.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        assert fill.avg_price == pytest.approx(0.51, abs=0.01)
+
+        # The book sags below entry and STAYS below — the position never goes
+        # green. Age it well past NO_PROGRESS_HOLD_S, then let the exit loop
+        # see it once: MFE starts negative, so the rule must fire immediately.
+        sag = make_book(market.token_id_yes, 0.42, 0.44)
+        app.feed.books[market.token_id_yes] = sag
+        await app.db._conn.execute(
+            "UPDATE trades SET entry_ts = ? WHERE id = ?",
+            (time.time() - 300, fill.trade_id),
+        )
+        await app._check_early_exits(equity=1000)
+
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "NO_PROGRESS"
+    finally:
+        await app.db.close()
+
+
+async def test_no_progress_never_cuts_trade_that_went_green(app_settings):
+    """
+    The no-progress exit must NEVER touch a position that once traded above
+    entry (MFE >= 0) — even if it later sags and is held long past the hold
+    threshold. Winners dip below entry before converging (the MAE -33% on the
+    live winner that recovered to +13.9% MFE), so a rule that only looks at
+    the CURRENT price would kill exactly the trades that are about to win.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        market = make_market(reference_price=65000)
+        entry_yes = make_book(market.token_id_yes, 0.49, 0.51)
+        entry_no = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, entry_yes, entry_no)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+
+        # Rally first (below the REPRICE target so no exit fires) — MFE goes
+        # positive. A +5.9% move from ~0.51 is under the ~10% reprice target.
+        rally = make_book(market.token_id_yes, 0.54, 0.56)
+        app.feed.books[market.token_id_yes] = rally
+        await app._check_early_exits(equity=1000)
+        assert len(await app.db.get_open_trades(mode="PAPER")) == 1  # still held
+
+        # Now sag below entry and age well past the threshold: MFE is still
+        # positive from the rally, so NO_PROGRESS must NOT fire.
+        sag = make_book(market.token_id_yes, 0.42, 0.44)
+        app.feed.books[market.token_id_yes] = sag
+        await app.db._conn.execute(
+            "UPDATE trades SET entry_ts = ? WHERE id = ?",
+            (time.time() - 300, fill.trade_id),
+        )
+        await app._check_early_exits(equity=1000)
+
+        assert len(await app.db.get_open_trades(mode="PAPER")) == 1  # never cut
+    finally:
+        await app.db.close()
+
+
 async def test_exit_probes_recorded_after_early_exit(app_settings):
     """
     Measurement layer: after an early exit the bot samples the held token's
@@ -847,8 +939,11 @@ async def test_duplicate_position_prevented(app_settings):
                 PriceUpdate(symbol="BTCUSDT", price=price, event_time_ms=0, received_at=now + i, kind="trade")
             )
         market = make_market(reference_price=65000)
-        yes_book = make_book(market.token_id_yes, 0.49, 0.51)
-        no_book = make_book(market.token_id_no, 0.49, 0.51)
+        # YES below the 0.45 entry cap so the entry is allowed; NO priced high
+        # so the pair sums >= $1 and sum-to-one does not also fire (this test
+        # is about duplicate prevention, not the entry-price cap).
+        yes_book = make_book(market.token_id_yes, 0.39, 0.41)
+        no_book = make_book(market.token_id_no, 0.59, 0.61)
         app.feed.register(market, yes_book, no_book)
         app._known_markets[market.market_id] = market
 

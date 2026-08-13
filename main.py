@@ -1346,6 +1346,26 @@ class TradingApp:
                     await self._try_early_exit(market, t["id"], "GAP_EXPIRED")
                     continue
 
+            # No-progress exit (added 2026-08-13): if the position has NEVER
+            # once traded above entry (MFE < 0 — the walked executable bid
+            # never crossed entry) after NO_PROGRESS_HOLD_S, the convergence
+            # the entry predicted never materialized at all — this is a dead
+            # trade, not a slow one. GAP_EXPIRED covers "didn't reprice in
+            # time" but needs an asset to have closed REPRICE winners first;
+            # this is the stats-free backstop for the never-green loser class
+            # (live 2026-08-13: a never-positive BTC NO @ 0.27 rode 540s to
+            # settlement at 0 -> -$36.69). MFE is measured from the same
+            # walked executable bid as every other exit, so a trade that ever
+            # crossed entry (mfe >= 0) is NEVER touched by this rule.
+            mfe_pct = self._mfe.get(t["id"])
+            if (
+                mfe_pct is not None
+                and mfe_pct < 0.0
+                and held_s >= settings.NO_PROGRESS_HOLD_S
+            ):
+                await self._try_early_exit(market, t["id"], "NO_PROGRESS")
+                continue
+
             try:
                 yes_book = await self.feed.get_order_book(market.market_id, market.token_id_yes)
                 no_book = await self.feed.get_order_book(market.market_id, market.token_id_no)

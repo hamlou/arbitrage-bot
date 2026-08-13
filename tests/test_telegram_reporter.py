@@ -699,10 +699,13 @@ async def test_pause_flag_blocks_new_trades_but_keeps_state(app_settings):
         from tests.test_main_integration import make_book, make_market
 
         market = make_market(reference_price=65000)
+        # YES below the 0.45 entry cap so the resumed cycle can trade; NO
+        # priced high so YES+NO sums >= $1 and sum-to-one does not also fire
+        # (this test is about the pause flag, not the entry cap).
         app.feed.register(
             market,
-            make_book(market.token_id_yes, 0.49, 0.51),
-            make_book(market.token_id_no, 0.49, 0.51),
+            make_book(market.token_id_yes, 0.39, 0.41),
+            make_book(market.token_id_no, 0.59, 0.61),
         )
         app._known_markets[market.market_id] = market
 
