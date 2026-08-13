@@ -259,6 +259,17 @@ class TradingApp:
         # first, 2026-08-12).
         self._reprice_stats: dict[str, Optional[float]] = {}
         self._reprice_stats_at: float = 0.0
+        # Sum-to-one near-miss measurement (2026-08-13, pure diagnostics):
+        # per-day rolling stats from every sum-to-one scan cycle — markets
+        # checked, best YES+NO combined ask seen, how many pairs summed
+        # below $1, how many cleared the fee-netted edge (real opportunities).
+        # This answers "is the risk-free leg rare-but-real (consistently at
+        # ~1.005, occasionally dipping under $1) or never close (always
+        # 1.02+)?" — the arb leg has never traded in the current era, and
+        # zero fires is ambiguous until we can see the misses. Surfaced in
+        # the command-center state file and overview API. Never gates anything.
+        self._sto_scan: dict[str, dict] = {}
+        self._sto_scan_logged_at: float = 0.0
         # Per-symbol baseline (price, received_at) for the lag tracker.
         # 2026-08-08 fix (measured, not guessed): this used to compare each
         # tick to the PREVIOUS tick and required a 0.10% single-tick move —
@@ -769,6 +780,10 @@ class TradingApp:
             except Exception:
                 logger.exception("Sum-to-one maker check failed this cycle")
 
+        # Near-miss diagnostics day key (UTC) — hoisted so the end-of-scan
+        # summary below works even when the market loop never runs.
+        day_key = time.strftime("%Y-%m-%d", time.gmtime())
+
         for market in list(self._sto_markets.values()):
             if market.market_id in self._known_markets:
                 continue  # the directional cycle already scans this one
@@ -791,12 +806,30 @@ class TradingApp:
                     logger.debug("Sum-to-one: could not fetch books for %s, skipping this cycle", market.market_id)
                     continue
 
+                # Near-miss measurement (2026-08-13, pure diagnostics): record
+                # EVERY pair's combined ask, not just the ones that fire — so
+                # we can tell "rare-but-real" (consistently ~1.005, sometimes
+                # under $1) from "never close" (always 1.02+). Zero fires is
+                # ambiguous until the misses are visible.
+                yes_ask = yes_book.best_ask
+                no_ask = no_book.best_ask
+                if yes_ask is None or no_ask is None:
+                    continue
+                stats = self._sto_scan.setdefault(day_key, {"checked": 0, "best_combined": None, "below_one": 0, "edge_cleared": 0})
+                stats["checked"] += 1
+                combined = yes_ask + no_ask
+                if stats["best_combined"] is None or combined < stats["best_combined"]:
+                    stats["best_combined"] = combined
+                if combined < 1.0:
+                    stats["below_one"] += 1
+
                 sto = find_sum_to_one_opportunity(
                     market, yes_book, no_book,
                     settings.SUM_TO_ONE_MIN_EDGE_PCT, settings.TAKER_FEE_PCT,
                 )
                 if sto is None:
                     continue
+                stats["edge_cleared"] += 1
 
                 fresh_exposure = await self.broker.get_total_exposure_usd()
                 headroom = max(0.0, settings.MAX_TOTAL_EXPOSURE_PCT * equity - fresh_exposure)
@@ -841,6 +874,23 @@ class TradingApp:
                 except Exception:
                     logger.exception("Sum-to-one order failed for market %s", market.market_id)
                 return  # one risk-free entry per cycle is enough
+
+        # Roll the near-miss diagnostics: drop days older than today, and log
+        # a throttled (1/min) summary of the current day's scan on the common
+        # no-opportunity path. Pure reporting — never gates anything.
+        for old in [k for k in self._sto_scan if k != day_key]:
+            self._sto_scan.pop(old, None)
+        if (
+            self._sto_scan.get(day_key, {}).get("checked", 0)
+            and time.time() - self._sto_scan_logged_at >= 60.0
+        ):
+            self._sto_scan_logged_at = time.time()
+            s = self._sto_scan[day_key]
+            logger.info(
+                "sum-to-one scan: %d markets checked, best YES+NO ask = %.3f "
+                "(below $1: %d, edge-cleared: %d)",
+                s["checked"], s["best_combined"], s["below_one"], s["edge_cleared"],
+            )
 
     async def _trading_loop(self) -> None:
         while not self._shutdown.is_set():
@@ -1892,6 +1942,10 @@ class TradingApp:
                 "exported_at": now,
                 "uptime_s": int(now - self._started_at),
                 **snapshot,
+                # Near-miss diagnostics for the risk-free leg (see the scan
+                # method): markets checked / best YES+NO ask / below $1 /
+                # edge-cleared per UTC day. Pure reporting.
+                "sum_to_one_scan": self._sto_scan,
                 "markets": markets,
                 "positions": positions,
             }

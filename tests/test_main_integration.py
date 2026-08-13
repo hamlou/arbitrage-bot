@@ -561,6 +561,51 @@ async def test_early_exit_skips_sum_to_one_legs(app_settings):
         await app.db.close()
 
 
+async def test_sum_to_one_scan_records_near_misses(app_settings):
+    """
+    Near-miss measurement (added 2026-08-13): the risk-free leg's availability
+    must be visible even when nothing fires — "rare-but-real" (combined ask
+    hugging $1, occasionally dipping under) vs "never close" (always 1.02+)
+    are indistinguishable from zero trades alone. Every scanned pair's
+    combined ask is recorded per UTC day in app._sto_scan: markets checked,
+    best combined ask, count below $1, count that cleared the fee edge.
+    Pure reporting — never gates or trades.
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+
+        # Near miss ABOVE $1: combined ask 1.07 — no opportunity, but recorded.
+        m1 = make_market(market_id="m_near")
+        app.feed.register(
+            m1,
+            make_book(m1.token_id_yes, 0.48, 0.50),
+            make_book(m1.token_id_no, 0.55, 0.57),
+        )
+        # Below $1 but fee-blocked: combined ask 0.97, crypto fees (~3.5c)
+        # eat the 3c gross edge — the pair that never quite clears.
+        m2 = make_market(market_id="m_below")
+        app.feed.register(
+            m2,
+            make_book(m2.token_id_yes, 0.44, 0.46),
+            make_book(m2.token_id_no, 0.49, 0.51),
+        )
+        app._sto_markets = {m1.market_id: m1, m2.market_id: m2}
+
+        await app._scan_sum_to_one_universe(equity=1000, cash=500)
+
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        stats = app._sto_scan[day]
+        assert stats["checked"] == 2
+        assert stats["best_combined"] == pytest.approx(0.97, abs=0.001)  # m2's 0.46 + 0.51
+        assert stats["below_one"] == 1
+        assert stats["edge_cleared"] == 0  # nothing actually fired
+        assert await app.db.get_open_trades(mode="PAPER") == []
+    finally:
+        await app.db.close()
+
+
 async def test_edge_reversal_respects_min_hold(app_settings):
     """
     Regression for the 2026-08-10 live losses: EDGE_REVERSAL fired 1-45s

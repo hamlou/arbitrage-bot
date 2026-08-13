@@ -269,6 +269,19 @@ Two changes (this is the LAST threshold change until the 100+ trade bar):
    keeping the historical winner zone (avg 0.39) fully tradable. Touches
    zero winners by construction: no win in the record has ever entered
    ≥ 0.50. The signal gate continues logging every blocked entry.
+
+   **PROVISIONAL — same caveat as the 0.58 cap it replaced.** 0.58 was set
+   "primarily by the out-of-sample 79-market study, with the live fills as
+   support, NOT as validation of a number fit to those same trades." The
+   0.58→0.45 tightening was user-directed (see above) and justified by the
+   same 79-market study + the mechanism (max-fee zone, min relative
+   mispricing), but it was ALSO fit to the 4 live losers at ≥ 0.50 that
+   prompted it — 4 trades is not enough to separate a structural pattern
+   from a bad-luck streak, exactly the mistake this project has made
+   before. So: **re-evaluate at 30+ forward trades, do NOT tune again
+   before then**, no matter how clean or ugly the next loss cluster looks.
+   This is not a confirmed fix; it is a hypothesis the forward record must
+   judge, logged as such.
 2. **`NO_PROGRESS_HOLD_S = 120.0` + `NO_PROGRESS` exit** — the stats-free
    backstop for the never-green loser class: if a position's walked
    executable bid has NEVER crossed above entry (MFE < 0) after 120s
@@ -284,6 +297,27 @@ the walked executable bid); no new strategy, no frozen value besides the cap
 itself. 477 tests pass (3 new: cap blocks a 0.50 ask / allows 0.44;
 NO_PROGRESS fires on a never-green aged position; never fires on a trade
 that went green).
+
+### 2026-08-13 — Sum-to-one near-miss measurement (diagnostics only, allowed)
+
+External review (Claude) correctly flagged that "sum-to-one has fired zero
+times in the current era" is ambiguous: true `yes_ask+no_ask < $1`
+mispricings on a liquid platform get arbed by faster bots in seconds, so
+zero fires could mean the edge is genuinely rare OR that the scanner never
+gets close. Added pure measurement to `_scan_sum_to_one_universe`: every
+scanned pair's combined ask is now recorded per UTC day (`app._sto_scan`:
+markets checked, best YES+NO combined ask, count below $1, count that
+cleared the fee-netted edge), surfaced in the command-center state file and
+`/api/overview` as `sum_to_one_scan`, with a throttled 1/min INFO log line
+on the no-opportunity path. This tells us, from data, whether the arb leg
+is "rare-but-real" (hugging ~1.005, occasionally dipping under $1) or
+"never close" (always 1.02+) — which decides whether widening coverage is
+worth it or the leg is low-frequency by nature. Nothing gates or trades.
+Also answered the review's governance question in this entry: the 0.45 cap
+was USER-directed ("find a solution!!"), not agent-initiated, and it is now
+explicitly marked PROVISIONAL with a 30+ forward-trade re-evaluation bar.
+478 tests pass (1 new: near-miss records above-$1 and below-$1-but-fee-
+blocked pairs with zero trades).
 
 ---
 
