@@ -282,6 +282,35 @@ class Settings(BaseSettings):
     # than sharing Kelly sizing with the directional strategy.
     SUM_TO_ONE_MIN_EDGE_PCT: float = 0.01
     SUM_TO_ONE_MAX_POSITION_PCT: float = 0.10
+
+    # --- Cross-window (5m/15m same-endTime) arbitrage --------------------------
+    # Second risk-free leg (added 2026-08-13, sourced from public bot
+    # research — verified mathematically, not copied): two Polymarket windows
+    # on the SAME asset with the SAME endTime resolve against the SAME
+    # end-of-window BTC/ETH price but have DIFFERENT beat prices (the price
+    # at each window's own open). If the lower-beat window's beat is X and
+    # the higher-beat window's is Y, then buying UP on the lower-beat window
+    # + DOWN on the higher-beat window pays >= $1 for every possible outcome
+    # (exactly $1 in the two outer bands, $2 in the middle band where
+    # X < final price <= Y) — the same arithmetic guarantee as sum-to-one,
+    # exploited across windows instead of across YES/NO tokens. Own position
+    # cap and min edge, mirroring the sum-to-one settings.
+    CROSS_WINDOW_ENABLED: bool = True
+    CROSS_WINDOW_MIN_EDGE_PCT: float = 0.01
+    CROSS_WINDOW_MAX_POSITION_PCT: float = 0.10
+    # Minimum relative gap between the two windows' beat prices (fraction of
+    # the lower beat). Guarantees (a) the pair is genuinely two different
+    # windows (a zero gap degenerates into sum-to-one) and (b) the beat
+    # ORDERING is robust to the reference-price approximation error — the
+    # wrong order turns the guaranteed arb into a directional bet, so the
+    # gap must be large relative to the capture noise.
+    CROSS_WINDOW_MIN_BEAT_GAP_PCT: float = 0.0005   # 0.05% (~$30 at $60k)
+    # The reference price is captured at first sighting; it approximates the
+    # window's real beat only when captured within a few seconds of the
+    # window's OPEN. Discovery runs every ~3s, so a timely sighting is a few
+    # seconds late; this is the maximum allowed capture delay before the
+    # reference is considered too stale to trust for beat ordering.
+    CROSS_WINDOW_MAX_REF_CAPTURE_DELAY_S: float = 10.0
     # --- Sum-to-one universe (Lever 1, added 2026-08-08) ------------------
     # The sum-to-one check is arithmetic and works on ANY binary market, but
     # discovery was confined to crypto up/down (tag_slug=up-or-down) — the
@@ -482,6 +511,7 @@ class Settings(BaseSettings):
         "TOTAL_DRAWDOWN_KILL_PCT",
         "MAX_TOTAL_EXPOSURE_PCT",
         "SUM_TO_ONE_MAX_POSITION_PCT",
+        "CROSS_WINDOW_MAX_POSITION_PCT",
         "EDGE_REVERSAL_EXIT_THRESHOLD_PCT",
         "REPRICE_EXIT_GAIN_PCT",
         "REPRICE_EXIT_FEE_MARGIN",

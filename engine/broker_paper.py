@@ -17,6 +17,7 @@ from config.settings import settings
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed
 from engine import fees
 from engine.fees import DEFAULT_TAKER_FEE_RATE
+from engine.cross_window import CrossWindowOpportunity
 from engine.sum_to_one import SumToOneOpportunity
 from storage.db import Database
 
@@ -110,6 +111,26 @@ class SumToOneEdgeLostError(Exception):
     def __init__(self, combined_cost: float, locked_edge_pct: float, action: str = "both legs reversed"):
         super().__init__(
             f"Sum-to-one edge not locked: combined cost {combined_cost:.3f} "
+            f"(locked edge {locked_edge_pct:.2%}) — {action}"
+        )
+        self.combined_cost = combined_cost
+        self.locked_edge_pct = locked_edge_pct
+
+
+class CrossWindowEdgeLostError(Exception):
+    """
+    Raised by place_cross_window_order when the combined fill price of the
+    two legs no longer locks a profit: the pre-quote walk exceeds $1 (best
+    asks summed below it but the real ask walk doesn't), or the fills land
+    at >= $1 after the book moved during the fill latency. Same class of
+    failure as SumToOneEdgeLostError — in the post-fill case the broker
+    reverses both legs only when reversing loses less than the (exact,
+    equal-share) worst-case hold.
+    """
+
+    def __init__(self, combined_cost: float, locked_edge_pct: float, action: str = "both legs reversed"):
+        super().__init__(
+            f"Cross-window edge not locked: combined cost {combined_cost:.3f} "
             f"(locked edge {locked_edge_pct:.2%}) — {action}"
         )
         self.combined_cost = combined_cost
@@ -746,6 +767,203 @@ class PaperBroker:
             shares=filled,
         )
 
+    # --- Cross-window (5m/15m same-endTime) execution (added 2026-08-13) ---
+    # The second risk-free leg: buy UP on the lower-beat window + DOWN on the
+    # higher-beat window (same asset, same endTime). Equal-share sizing, both
+    # legs held to settlement, edge re-validated from actual fills with the
+    # same reverse-vs-hold fallback as sum-to-one. The only difference from
+    # place_sum_to_one_order is that the two legs live in DIFFERENT markets.
+
+    async def place_cross_window_order(
+        self, opportunity: CrossWindowOpportunity, total_size_usd: float,
+        book_source: Optional[object] = None,
+    ) -> tuple[Fill, Fill]:
+        """
+        Opens BOTH legs of a cross-window arb at the SAME share count (equal-
+        share sizing — the payout is >= $1 regardless of outcome, exactly the
+        property that makes the arb risk-free). Mirrors place_sum_to_one_order
+        step for step: equal-share capacity from both books, pre-quote the
+        real walk and refuse a combo whose fill walk exceeds $1, affordability
+        at walked prices, place both legs concurrently (a sequential path lets
+        the book move twice between the halves of the hedge), then re-validate
+        the locked edge from the ACTUAL fills and reverse-or-hold per
+        _resolve_cross_window_edge_loss.
+        """
+        combo_group_id = str(uuid.uuid4())
+        half_budget = total_size_usd / 2
+        rate_a = self._fee_rate_for(opportunity.market_a)
+        rate_b = self._fee_rate_for(opportunity.market_b)
+
+        async def _book(market: Market, token_id: str) -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        book_a = await _book(opportunity.market_a, opportunity.token_id_a)
+        book_b = await _book(opportunity.market_b, opportunity.token_id_b)
+
+        # (1) Equal-share capacity: the max shares EACH book absorbs within
+        # its half-budget; the binding (thinner) side caps the whole pair.
+        shares_target = min(
+            self._max_shares_within_budget(book_a, half_budget),
+            self._max_shares_within_budget(book_b, half_budget),
+        )
+        if shares_target <= 0:
+            raise CrossWindowEdgeLostError(
+                0.0, 0.0,
+                action="refused before placing — no equal-share size both books support",
+            )
+
+        # (2) Quote the REAL equal-share fills before opening anything: the
+        # opportunity was detected against best asks, but each leg fills by
+        # WALKING the ask side — the walked combined cost can exceed $1 even
+        # when the best asks sum below it.
+        try:
+            avg_a, _ = self._walk_book_for_shares(book_a, shares_target)
+            avg_b, _ = self._walk_book_for_shares(book_b, shares_target)
+        except ValueError:
+            raise CrossWindowEdgeLostError(
+                0.0, 0.0,
+                action="refused before placing — insufficient book depth to fill both legs equally",
+            )
+        per_share_cost = (
+            avg_a + avg_b
+            + fees.taker_fee_per_share(avg_a, rate_a)
+            + fees.taker_fee_per_share(avg_b, rate_b)
+        )
+        locked_edge_per_share = 1.0 - per_share_cost
+        if locked_edge_per_share <= 0:
+            raise CrossWindowEdgeLostError(
+                per_share_cost, locked_edge_per_share,
+                action="refused before placing — the real equal-share walk exceeds $1",
+            )
+
+        # (3) Affordability at the WALKED prices: shrink to the whole shares
+        # the budget supports, or refuse when even one pair can't be afforded.
+        affordable = self.balance_usd / per_share_cost
+        if affordable < 1.0:
+            raise InsufficientBalanceError(
+                f"Balance ${self.balance_usd:.2f} cannot afford one cross-window pair "
+                f"(per-share cost ${per_share_cost:.3f})"
+            )
+        if affordable < shares_target:
+            shares_target = int(affordable)
+            avg_a, _ = self._walk_book_for_shares(book_a, shares_target)
+            avg_b, _ = self._walk_book_for_shares(book_b, shares_target)
+            per_share_cost = (
+                avg_a + avg_b
+                + fees.taker_fee_per_share(avg_a, rate_a)
+                + fees.taker_fee_per_share(avg_b, rate_b)
+            )
+            locked_edge_per_share = 1.0 - per_share_cost
+            if locked_edge_per_share <= 0:
+                raise CrossWindowEdgeLostError(
+                    per_share_cost, locked_edge_per_share,
+                    action="refused before placing — shrunk equal-share walk exceeds $1",
+                )
+        total_cost = shares_target * per_share_cost
+        if total_cost > self.balance_usd:
+            raise InsufficientBalanceError(
+                f"Cross-window combo cost incl. fees ${total_cost:.2f} exceeds "
+                f"paper balance ${self.balance_usd:.2f}"
+            )
+
+        # (4) Submit BOTH legs concurrently at exactly `shares_target`
+        # shares. If one leg fails, reverse the leg that opened so the hedge
+        # is never left half-open.
+        results = await asyncio.gather(
+            self._place_cross_window_leg(
+                opportunity.market_a, opportunity.token_id_a,
+                opportunity.side_a, shares_target, avg_a,
+                combo_group_id, book_source,
+            ),
+            self._place_cross_window_leg(
+                opportunity.market_b, opportunity.token_id_b,
+                opportunity.side_b, shares_target, avg_b,
+                combo_group_id, book_source,
+            ),
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        if failed:
+            for fill, market in zip(results, (opportunity.market_a, opportunity.market_b)):
+                if isinstance(fill, Exception):
+                    continue
+                try:
+                    await self.close_position_early(
+                        market, fill.trade_id, reason="CROSS_WINDOW_LEG_FAILED",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to reverse cross-window leg after sibling failure"
+                    )
+            raise failed[0]
+        fill_a, fill_b = results  # type: ignore[assignment]
+
+        # (5) Re-validate the locked edge from the ACTUAL fills (each leg
+        # filled after the simulated fill latency against a book that kept
+        # moving). With EQUAL shares, holding to settlement is exactly
+        # risk-free at a positive edge — _resolve_cross_window_edge_loss
+        # only reverses when it loses strictly less than the worst-case hold.
+        combined_cost = fill_a.avg_price + fill_b.avg_price
+        fee_cost = (
+            fees.taker_fee_pct(fill_a.avg_price, rate_a)
+            + fees.taker_fee_pct(fill_b.avg_price, rate_b)
+        )
+        locked_edge_pct = (1.0 - combined_cost) - fee_cost
+        if locked_edge_pct <= 0:
+            action = await self._resolve_cross_window_edge_loss(
+                opportunity, fill_a, fill_b, combo_group_id,
+            )
+            raise CrossWindowEdgeLostError(combined_cost, locked_edge_pct, action=action)
+
+        return fill_a, fill_b
+
+    async def _place_cross_window_leg(
+        self, market: Market, token_id: str, side: str, shares: float,
+        quoted_avg: float, combo_group_id: str, book_source: Optional[object],
+    ) -> Fill:
+        """
+        Open ONE leg of a cross-window pair at EXACTLY `shares` shares in its
+        own market. Waits the simulated fill latency, re-walks the live book
+        at `shares`, then records the trade with its price-dependent fee.
+        Raises on failure so the caller can reverse the sibling leg.
+        """
+
+        async def _book() -> OrderBook:
+            if book_source is not None:
+                cached = book_source(token_id)
+                if cached is not None:
+                    return cached
+            return await self.feed.get_order_book(market.market_id, token_id)
+
+        if self.simulated_fill_latency_s > 0:
+            await asyncio.sleep(self.simulated_fill_latency_s)
+        book = await _book()
+        avg_price, filled = self._walk_book_for_shares(book, shares)
+        if filled < shares - 1e-9:
+            raise ValueError(
+                f"Cross-window leg {side}: only {filled:.2f} of {shares:.2f} shares "
+                "fillable after fill latency"
+            )
+        avg_price = _round_to_tick(avg_price, self.tick_size)
+        rate = self._fee_rate_for(market)
+        size_usd = shares * avg_price
+        fee_usd = shares * fees.taker_fee_per_share(avg_price, rate)
+        if size_usd + fee_usd > self.balance_usd:
+            raise InsufficientBalanceError(
+                f"Cross-window leg {side} cost ${size_usd + fee_usd:.2f} exceeds "
+                f"paper balance ${self.balance_usd:.2f}"
+            )
+        return await self._record_trade(
+            market, side, size_usd, avg_price, fee_usd,
+            strategy="cross_window", combo_group_id=combo_group_id,
+            slippage_pct=0.0, decision_best_ask=quoted_avg, fill_best_ask=avg_price,
+            shares=filled,
+        )
+
     # --- Sum-to-one MAKER execution (added 2026-08-12) ---------------------
     # Takers pay rate * p * (1 - p) per share on BOTH legs; MAKERS pay zero
     # and earn a rebate (20% on crypto). Post the CHEAPER leg as a resting
@@ -1172,6 +1390,59 @@ class PaperBroker:
 
         logger.warning(
             "Sum-to-one edge lost at fill for combo %s: holding to settlement "
+            "(worst-case hold PnL $%.2f vs reversal PnL %s) — the pair resolves normally",
+            combo_group_id, hold_worst_pnl,
+            f"${reversal_pnl:.2f}" if reversal_pnl is not None else "n/a (no full bid depth)",
+        )
+        return "both legs held to settlement"
+
+    async def _resolve_cross_window_edge_loss(
+        self, opportunity: CrossWindowOpportunity,
+        fill_a: Fill, fill_b: Fill, combo_group_id: str,
+    ) -> str:
+        """
+        Post-fill edge-loss fallback for cross-window pairs: decide between
+        reversing both legs now and holding the pair to settlement —
+        whichever loses LESS. Same logic as _resolve_edge_loss, with the two
+        legs living in different markets (each reversed via its own market's
+        bid side). With equal-share sizing the worst-case hold payout is
+        exactly the winning leg's shares, so hold_worst_pnl is exact.
+        """
+        shares_a = fill_a.size_usd / fill_a.avg_price if fill_a.avg_price else 0.0
+        shares_b = fill_b.size_usd / fill_b.avg_price if fill_b.avg_price else 0.0
+        entry_cost = fill_a.size_usd + fill_b.size_usd + fill_a.fee_usd + fill_b.fee_usd
+        hold_worst_pnl = min(shares_a, shares_b) - entry_cost
+
+        reversal_pnl: Optional[float] = None
+        net_proceeds = 0.0
+        for fill, market in ((fill_a, opportunity.market_a), (fill_b, opportunity.market_b)):
+            leg_net = await self._quote_reversal_net(market, fill)
+            if leg_net is None:
+                reversal_pnl = None
+                break
+            net_proceeds += leg_net
+        else:
+            reversal_pnl = net_proceeds - entry_cost
+
+        if reversal_pnl is not None and reversal_pnl > hold_worst_pnl:
+            logger.warning(
+                "Cross-window edge lost at fill for combo %s: reversal PnL $%.2f beats "
+                "worst-case hold $%.2f — reversing both legs",
+                combo_group_id, reversal_pnl, hold_worst_pnl,
+            )
+            for fill, market in ((fill_a, opportunity.market_a), (fill_b, opportunity.market_b)):
+                try:
+                    await self.close_position_early(
+                        market, fill.trade_id, reason="CROSS_WINDOW_EDGE_LOST",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to reverse cross-window leg %d after edge loss", fill.trade_id,
+                    )
+            return "both legs reversed"
+
+        logger.warning(
+            "Cross-window edge lost at fill for combo %s: holding to settlement "
             "(worst-case hold PnL $%.2f vs reversal PnL %s) — the pair resolves normally",
             combo_group_id, hold_worst_pnl,
             f"${reversal_pnl:.2f}" if reversal_pnl is not None else "n/a (no full bid depth)",

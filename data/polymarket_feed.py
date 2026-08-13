@@ -130,6 +130,13 @@ class Market:
     # mid-contract, or discovery lags a market's true open, this will be
     # wrong. Flagged clearly rather than silently assumed correct.
     reference_price: Optional[float] = None
+    # When reference_price was captured (unix epoch). Set by main.py's
+    # discovery loop together with the price; enables the cross-window
+    # scanner to require the reference to have been captured within a few
+    # seconds of the window's OPEN (so the approximation ≈ the real beat
+    # price), not merely "early enough for fair-value direction". None for
+    # markets whose reference was captured before this field existed.
+    reference_captured_at: Optional[float] = None
     expires_at_ts: Optional[float] = None  # parsed from end_date_iso
     # Fee category ("crypto", "politics", "geopolitics", ...) derived from
     # Gamma's event tags. Drives the category-aware taker fee rate in
@@ -139,9 +146,16 @@ class Market:
     # category (callers then fall back to the configured crypto rate).
     category: Optional[str] = None
 
-    def with_reference_price(self, price: float) -> "Market":
-        """Frozen dataclass — returns a copy with reference_price set."""
-        return dataclass_replace(self, reference_price=price)
+    def with_reference_price(self, price: float, captured_at: Optional[float] = None) -> "Market":
+        """Frozen dataclass — returns a copy with reference_price set. When
+        captured_at is given (a NEW capture), it is recorded too; otherwise
+        the existing capture time is preserved (used when re-stamping a
+        known market's price after a restart)."""
+        if captured_at is None:
+            captured_at = self.reference_captured_at
+        return dataclass_replace(
+            self, reference_price=price, reference_captured_at=captured_at,
+        )
 
     @property
     def time_remaining_s(self) -> Optional[float]:

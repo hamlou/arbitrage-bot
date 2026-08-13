@@ -324,6 +324,7 @@ def overview() -> dict[str, Any]:
         "strategy": list(by_strategy.values()),
         "signals_today": {"total": (sig_total or {}).get("n", 0), "fired": len(signals_fired)},
         "sum_to_one_scan": state.get("sum_to_one_scan"),
+        "cross_window_scan": state.get("cross_window_scan"),
         "recent_trades": recent,
         "markets": markets,
         "positions": positions_state,

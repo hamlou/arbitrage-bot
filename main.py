@@ -27,7 +27,11 @@ from data.coinbase_feed import CoinbaseFeed
 from data.polymarket_feed import Market, OrderBook, PolymarketFeed, TokenNotFoundError
 from data.polymarket_ws_feed import PolymarketWSFeed
 from engine.broker_live import LiveBroker, LiveTradingNotEnabledError, build_live_broker
-from engine.broker_paper import PaperBroker, SumToOneEdgeLostError
+from engine.broker_paper import CrossWindowEdgeLostError, PaperBroker, SumToOneEdgeLostError
+from engine.cross_window import (
+    find_cross_window_opportunity,
+    find_cross_window_pair,
+)
 from engine.calibration import load_calibration
 from engine.exit_forensics import build_digest_summary
 from engine.feed_health import FeedHealth
@@ -270,6 +274,14 @@ class TradingApp:
         # the command-center state file and overview API. Never gates anything.
         self._sto_scan: dict[str, dict] = {}
         self._sto_scan_logged_at: float = 0.0
+        # Cross-window scan diagnostics (added 2026-08-13, measurement-only):
+        # per UTC day, how many same-endTime 5m/15m pairs were found (with
+        # trusted reference prices), the best (lowest) combined ask seen, and
+        # how many cleared the fee-netted edge. Same "rare-but-real vs never
+        # close" question as _sto_scan, for the second risk-free leg. Surfaced
+        # in the state file + overview API; never gates anything.
+        self._cw_scan: dict[str, dict] = {}
+        self._cw_scan_logged_at: float = 0.0
         # Per-symbol baseline (price, received_at) for the lag tracker.
         # 2026-08-08 fix (measured, not guessed): this used to compare each
         # tick to the PREVIOUS tick and required a 0.10% single-tick move —
@@ -487,7 +499,10 @@ class TradingApp:
                 for m in markets:
                     existing = self._known_markets.get(m.market_id)
                     if existing is not None and existing.reference_price is not None:
-                        m = m.with_reference_price(existing.reference_price)
+                        m = m.with_reference_price(
+                            existing.reference_price,
+                            captured_at=existing.reference_captured_at,
+                        )
                     elif m.market_id not in self._known_markets:
                         # Reference-price trust guard (verified 2026-08-07):
                         # the fair-value model needs the price at the market's
@@ -527,7 +542,9 @@ class TradingApp:
                         else:
                             ref_price = self.signal_engine.current_price(m.asset)
                             if ref_price is not None:
-                                m = m.with_reference_price(ref_price)
+                                m = m.with_reference_price(
+                                    ref_price, captured_at=time.time(),
+                                )
                             else:
                                 logger.debug("No Binance price yet to use as reference for new market %s", m.market_id)
                     self._known_markets[m.market_id] = m
@@ -892,6 +909,126 @@ class TradingApp:
                 s["checked"], s["best_combined"], s["below_one"], s["edge_cleared"],
             )
 
+    async def _scan_cross_window_universe(self, equity: float, cash: float) -> None:
+        """
+        Second risk-free leg (added 2026-08-13, sourced from verified public
+        Polymarket-bot research — see engine/cross_window.py): two windows on
+        the SAME asset with the SAME endTime resolve against the SAME final
+        price but have DIFFERENT beat prices (each window's price at its own
+        open). Buying UP on the lower-beat window + DOWN on the higher-beat
+        window pays >= $1 for every outcome (the middle band pays $2) —
+        pure arithmetic like sum-to-one, no direction prediction. The pairs
+        come from _known_markets (the directional universe IS the short
+        BTC/ETH windows this needs). At most ONE entry per cycle, like the
+        sum-to-one scan.
+        """
+        if not settings.CROSS_WINDOW_ENABLED:
+            return
+        if not isinstance(self.broker, PaperBroker) or not self._known_markets:
+            return
+
+        day_key = time.strftime("%Y-%m-%d", time.gmtime())
+
+        # Group the directional universe by (asset, endTime). A group with
+        # both a 5m and a 15m window only exists during the last ~5 minutes
+        # of each 15m cycle — that overlap is the only window the arb exists
+        # in.
+        by_end: dict[tuple[str, float], list[Market]] = {}
+        for m in self._known_markets.values():
+            if m.expires_at_ts is None or m.asset not in ("BTC", "ETH"):
+                continue
+            by_end.setdefault((m.asset, m.expires_at_ts), []).append(m)
+
+        for (asset, _end_ts), group in by_end.items():
+            pair = find_cross_window_pair(
+                group,
+                max_ref_capture_delay_s=settings.CROSS_WINDOW_MAX_REF_CAPTURE_DELAY_S,
+                min_beat_gap_pct=settings.CROSS_WINDOW_MIN_BEAT_GAP_PCT,
+            )
+            if pair is None:
+                continue
+            lower, higher = pair
+            if self.broker.has_open_position(lower.market_id) or self.broker.has_open_position(higher.market_id):
+                continue
+            async with self._entry_lock:
+                if self.broker.has_open_position(lower.market_id) or self.broker.has_open_position(higher.market_id):
+                    continue
+                try:
+                    # We buy UP on the lower-beat window and DOWN on the
+                    # higher-beat window.
+                    lower_up_book = await self.feed.get_order_book(lower.market_id, lower.token_id_yes)
+                    higher_down_book = await self.feed.get_order_book(higher.market_id, higher.token_id_no)
+                except TokenNotFoundError:
+                    continue  # gone from the CLOB — retry next cycle
+                except Exception:
+                    logger.debug(
+                        "Cross-window: could not fetch books for %s/%s, skipping this cycle",
+                        lower.market_id, higher.market_id,
+                    )
+                    continue
+
+                # Near-miss measurement (same philosophy as the sum-to-one
+                # scan): record every pair's combined ask so zero fires is
+                # interpretable — "rare-but-real" vs "never close".
+                stats = self._cw_scan.setdefault(
+                    day_key, {"pairs_checked": 0, "best_combined": None, "edge_cleared": 0},
+                )
+                stats["pairs_checked"] += 1
+                ask_a = lower_up_book.best_ask
+                ask_b = higher_down_book.best_ask
+                if ask_a is not None and ask_b is not None:
+                    combined = ask_a + ask_b
+                    if stats["best_combined"] is None or combined < stats["best_combined"]:
+                        stats["best_combined"] = combined
+
+                opp = find_cross_window_opportunity(
+                    lower, higher, lower_up_book, higher_down_book,
+                    settings.CROSS_WINDOW_MIN_EDGE_PCT, settings.TAKER_FEE_PCT,
+                )
+                if opp is None:
+                    continue
+                stats["edge_cleared"] += 1
+
+                fresh_exposure = await self.broker.get_total_exposure_usd()
+                headroom = max(0.0, settings.MAX_TOTAL_EXPOSURE_PCT * equity - fresh_exposure)
+                cw_size = min(settings.CROSS_WINDOW_MAX_POSITION_PCT * equity, headroom, cash)
+                if cw_size < self.broker.min_order_size_usd * 2:
+                    continue
+
+                try:
+                    fill_a, fill_b = await self.broker.place_cross_window_order(opp, cw_size)
+                    await self.alerter.send_alert(
+                        f"[{self.broker.mode}] Cross-window {asset} same-endTime pair "
+                        f"'{lower.question[:28]}' / '{higher.question[:28]}' ${cw_size:.2f} "
+                        f"({fill_a.side} {fill_a.avg_price:.3f} + {fill_b.side} {fill_b.avg_price:.3f}, "
+                        f"locked edge {opp.net_profit_pct:.2%})",
+                        level=AlertLevel.INFO,
+                    )
+                except CrossWindowEdgeLostError as e:
+                    # The real fill walk no longer locked a profit — refused
+                    # or reversed/held per the reverse-vs-hold decision.
+                    logger.info("Cross-window pair %s skipped: %s", asset, e)
+                except Exception:
+                    logger.exception(
+                        "Cross-window order failed for %s/%s", lower.market_id, higher.market_id,
+                    )
+                return  # one risk-free entry per cycle is enough
+
+        # Roll the diagnostics (same pattern as the sum-to-one scan).
+        for old in [k for k in self._cw_scan if k != day_key]:
+            self._cw_scan.pop(old, None)
+        if (
+            self._cw_scan.get(day_key, {}).get("pairs_checked", 0)
+            and time.time() - self._cw_scan_logged_at >= 60.0
+        ):
+            self._cw_scan_logged_at = time.time()
+            s = self._cw_scan[day_key]
+            logger.info(
+                "cross-window scan: %d pairs checked, best combined ask = %.3f "
+                "(edge-cleared: %d)",
+                s["pairs_checked"], s["best_combined"], s["edge_cleared"],
+            )
+
     async def _trading_loop(self) -> None:
         while not self._shutdown.is_set():
             try:
@@ -951,6 +1088,12 @@ class TradingApp:
         # BEFORE the directional pass — arithmetic, not prediction, and it
         # matters most when crypto windows are quiet.
         await self._scan_sum_to_one_universe(equity, cash)
+
+        # Lever 2 (2026-08-13): the cross-window (same-endTime 5m/15m) scan
+        # — the second arithmetic risk-free leg, sourced from verified public
+        # bot research. Runs right after sum-to-one: also no direction
+        # prediction, also one entry per cycle.
+        await self._scan_cross_window_universe(equity, cash)
 
         markets = list(self._known_markets.values())
         if not markets:
@@ -1272,16 +1415,16 @@ class TradingApp:
 
         open_trades = await self.db.get_open_trades(mode="PAPER")
         for t in open_trades:
-            # Sum-to-one legs are outcome-agnostic by construction (we hold
-            # BOTH sides to settlement; whichever wins pays $1, and the combo
-            # locked a profit below that). The directional model's opinion is
-            # meaningless for them, so REPRICE / TAKE_PROFIT / EDGE_REVERSAL
-            # must NEVER fire on a sum_to_one leg — exiting one leg early
-            # breaks the hedge. Verified 2026-08-07: the model "reversed" the
-            # NO leg of an ETH combo and sold it at 0.854 when holding to
-            # settlement would have paid 1.0 — turning a guaranteed win into
-            # a loss.
-            if (t.get("strategy") or "latency_arb") == "sum_to_one":
+            # Sum-to-one and cross-window legs are outcome-agnostic by
+            # construction (we hold BOTH legs to settlement; whichever wins
+            # pays $1, and the combo locked a profit below that). The
+            # directional model's opinion is meaningless for them, so
+            # REPRICE / TAKE_PROFIT / EDGE_REVERSAL must NEVER fire on these
+            # legs — exiting one leg early breaks the hedge. Verified
+            # 2026-08-07: the model "reversed" the NO leg of an ETH combo and
+            # sold it at 0.854 when holding to settlement would have paid 1.0
+            # — turning a guaranteed win into a loss.
+            if (t.get("strategy") or "latency_arb") in ("sum_to_one", "cross_window"):
                 continue
             market = self._known_markets.get(t["market_id"])
             if market is None or not t["entry_price"]:
@@ -1946,6 +2089,7 @@ class TradingApp:
                 # method): markets checked / best YES+NO ask / below $1 /
                 # edge-cleared per UTC day. Pure reporting.
                 "sum_to_one_scan": self._sto_scan,
+                "cross_window_scan": self._cw_scan,
                 "markets": markets,
                 "positions": positions,
             }

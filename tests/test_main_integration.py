@@ -19,6 +19,7 @@ from data.binance_feed import PriceUpdate
 from data.polymarket_feed import Market, OrderBook, OrderBookLevel
 import engine.feed_health as feed_health_module
 from engine.broker_live import LiveBroker
+from engine.cross_window import find_cross_window_opportunity
 from engine.sum_to_one import find_sum_to_one_opportunity
 from main import TradingApp
 import config.settings as settings_module
@@ -602,6 +603,149 @@ async def test_sum_to_one_scan_records_near_misses(app_settings):
         assert stats["below_one"] == 1
         assert stats["edge_cleared"] == 0  # nothing actually fired
         assert await app.db.get_open_trades(mode="PAPER") == []
+    finally:
+        await app.db.close()
+
+
+async def test_cross_window_scan_places_same_endtime_pair(app_settings):
+    """
+    The second risk-free leg (added 2026-08-13): a 5m and a 15m BTC window
+    sharing an endTime resolve against the same final price but different
+    beats — buying UP on the lower-beat window + DOWN on the higher-beat
+    window is guaranteed >= $1 at settlement. The scan must find the pair
+    from _known_markets and open BOTH legs as one combo.
+    """
+    app = await build_app(app_settings)
+    try:
+        end_ts = time.time() + 400  # both windows end together, 5m from now
+        m5 = Market(
+            market_id="cw5", question="Bitcoin Up or Down - 5 min",
+            token_id_yes="cw5_yes", token_id_no="cw5_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=5,
+            reference_price=64_000,            # lower beat -> buy UP
+            reference_captured_at=end_ts - 300 + 2,  # captured ~2s after open
+            expires_at_ts=end_ts, category="crypto",
+        )
+        m15 = Market(
+            market_id="cw15", question="Bitcoin Up or Down - 15 min",
+            token_id_yes="cw15_yes", token_id_no="cw15_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=15,
+            reference_price=65_000,            # higher beat -> buy DOWN
+            reference_captured_at=end_ts - 900 + 2,
+            expires_at_ts=end_ts, category="crypto",
+        )
+        # 5m UP ask 0.46 + 15m DOWN ask 0.48 = 0.94 -> real edge.
+        app.feed.register(m5, make_book(m5.token_id_yes, 0.44, 0.46), make_book(m5.token_id_no, 0.54, 0.56))
+        app.feed.register(m15, make_book(m15.token_id_yes, 0.54, 0.56), make_book(m15.token_id_no, 0.46, 0.48))
+        app._known_markets = {m5.market_id: m5, m15.market_id: m15}
+
+        await app._scan_cross_window_universe(equity=1000, cash=500)
+
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 2
+        assert {t["strategy"] for t in open_trades} == {"cross_window"}
+        assert len({t["combo_group_id"] for t in open_trades}) == 1
+        sides = {(t["market_id"], t["side"]) for t in open_trades}
+        assert sides == {("cw5", "YES"), ("cw15", "NO")}  # UP on lower beat, DOWN on higher
+
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        assert app._cw_scan[day]["pairs_checked"] == 1
+        assert app._cw_scan[day]["edge_cleared"] == 1
+    finally:
+        await app.db.close()
+
+
+async def test_cross_window_scan_rejects_untrusted_reference(app_settings):
+    """A window whose reference was captured far from its open cannot be
+    paired — the beat ordering (which window's beat is higher) decides which
+    pair is the guaranteed arb, so an unreliable reference is a hard reject,
+    not a soft skip. Nothing trades."""
+    app = await build_app(app_settings)
+    try:
+        end_ts = time.time() + 400
+        m5 = Market(
+            market_id="cw5b", question="Bitcoin Up or Down - 5 min",
+            token_id_yes="cw5b_yes", token_id_no="cw5b_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=5,
+            reference_price=64_000,
+            reference_captured_at=end_ts - 300 + 2,
+            expires_at_ts=end_ts, category="crypto",
+        )
+        # The 15m window's reference was captured 5 minutes into its life.
+        m15 = Market(
+            market_id="cw15b", question="Bitcoin Up or Down - 15 min",
+            token_id_yes="cw15b_yes", token_id_no="cw15b_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=15,
+            reference_price=65_000,
+            reference_captured_at=end_ts - 900 + 300,  # 5 min late
+            expires_at_ts=end_ts, category="crypto",
+        )
+        app.feed.register(m5, make_book(m5.token_id_yes, 0.44, 0.46), make_book(m5.token_id_no, 0.54, 0.56))
+        app.feed.register(m15, make_book(m15.token_id_yes, 0.54, 0.56), make_book(m15.token_id_no, 0.46, 0.48))
+        app._known_markets = {m5.market_id: m5, m15.market_id: m15}
+
+        await app._scan_cross_window_universe(equity=1000, cash=500)
+
+        assert await app.db.get_open_trades(mode="PAPER") == []
+    finally:
+        await app.db.close()
+
+
+async def test_early_exit_skips_cross_window_legs(app_settings):
+    """Cross-window legs are outcome-agnostic by construction (both legs held
+    to settlement, payout >= $1) — the directional model's exits must never
+    fire on them, exactly like sum-to-one legs."""
+    app = await build_app(app_settings)
+    try:
+        now = time.time()
+        # Strong DOWN move so the model reads NO with a big edge.
+        for i, price in enumerate([65000, 64800, 64600, 64400, 64200, 64000, 63800, 63600, 63400, 63200]):
+            app.signal_engine.ingest_price_update(
+                PriceUpdate(symbol="BTCUSDT", price=price, event_time_ms=0, received_at=now + i, kind="trade")
+            )
+
+        end_ts = time.time() + 400
+        m5 = Market(
+            market_id="cw5c", question="Bitcoin Up or Down - 5 min",
+            token_id_yes="cw5c_yes", token_id_no="cw5c_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=5,
+            reference_price=64_000,
+            reference_captured_at=end_ts - 300 + 2,
+            expires_at_ts=end_ts, category="crypto",
+        )
+        m15 = Market(
+            market_id="cw15c", question="Bitcoin Up or Down - 15 min",
+            token_id_yes="cw15c_yes", token_id_no="cw15c_no",
+            liquidity_usd=100_000, end_date_iso="2026-08-13T14:00:00Z",
+            asset="BTC", duration_minutes=15,
+            reference_price=65_000,
+            reference_captured_at=end_ts - 900 + 2,
+            expires_at_ts=end_ts, category="crypto",
+        )
+        app.feed.register(m5, make_book(m5.token_id_yes, 0.44, 0.46), make_book(m5.token_id_no, 0.54, 0.56))
+        app.feed.register(m15, make_book(m15.token_id_yes, 0.54, 0.56), make_book(m15.token_id_no, 0.46, 0.48))
+        app._known_markets = {m5.market_id: m5, m15.market_id: m15}
+
+        # Open a cross-window pair directly (broker-level, as the scan would).
+        lower_up = app.feed.books[m5.token_id_yes]
+        higher_down = app.feed.books[m15.token_id_no]
+        opp = find_cross_window_opportunity(
+            m5, m15, lower_up, higher_down,
+            settings_module.settings.CROSS_WINDOW_MIN_EDGE_PCT,
+            settings_module.settings.TAKER_FEE_PCT,
+        )
+        assert opp is not None
+        await app.broker.place_cross_window_order(opp, total_size_usd=100)
+        assert len(await app.db.get_open_trades(mode="PAPER")) == 2
+
+        await app._check_early_exits(equity=1000)
+        open_trades = await app.db.get_open_trades(mode="PAPER")
+        assert len(open_trades) == 2  # both legs still held — exits skipped
     finally:
         await app.db.close()
 
