@@ -471,4 +471,4 @@ async def test_db_log_exchange_disagreement_roundtrip(db):
 
 def test_cross_exchange_tolerance_default():
     settings = Settings(_env_file=None)
-    assert settings.CROSS_EXCHANGE_TOLERANCE_PCT == 0.1
+    assert settings.CROSS_EXCHANGE_TOLERANCE_PCT == 0.5

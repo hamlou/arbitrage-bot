@@ -74,7 +74,16 @@ class Settings(BaseSettings):
     # regardless of how many real divergences appeared. 0.75 keeps the
     # stale-data protection while letting depth >= ~$600 books trade.
     # Lowered 2026-08-07.
-    MIN_CONFIDENCE: float = 0.75
+    # Lowered 0.75 -> 0.70 on 2026-08-13 (measured, not guessed): live book
+    # depth on the target ask side runs median ~$292 (p75 ~$719) across all
+    # evaluations, and the would-fire signals (net edge > 4% after fees,
+    # entry <= 0.45) have median depth ~$488 with only 49% clearing the
+    # $500-equivalent 0.75 bar but 84.5% clearing 0.70 (depth >= ~$200,
+    # which still rejects genuinely empty books). 0.70 keeps the stale-data
+    # protection (freshness still decays to 0 by 5s) while no longer
+    # demanding more depth than the books these signals actually trade on
+    # offer.
+    MIN_CONFIDENCE: float = 0.70
     MIN_MARKET_LIQUIDITY_USD: float = 1_000.0
 
     # --- Entry discipline (directional strategy) ---------------------------
@@ -128,11 +137,22 @@ class Settings(BaseSettings):
     TAKER_FEE_PCT: float = 0.07
     # Cross-exchange sanity gate: before firing a signal, the latest known
     # Binance and Coinbase prices for the asset must agree within this many
-    # percent (0.1 = 0.1%). A bigger divergence usually means one feed is
+    # percent (0.5 = 0.5%). A bigger divergence usually means one feed is
     # stale or misbehaving — don't trade on it. The check is skipped (signal
     # allowed) when either source hasn't delivered a tick yet, since the bot
     # has always been able to run on Binance alone.
-    CROSS_EXCHANGE_TOLERANCE_PCT: float = 0.1
+    # Raised 0.1 -> 0.5 on 2026-08-13 (measured, not guessed): live audit data
+    # from the running bot showed Binance vs Coinbase disagreement on BTC/ETH
+    # sits at 0.10–0.133% essentially ALWAYS (2,000 consecutive observations,
+    # min 0.100, max 0.133) — i.e. the old 0.1% tolerance was below the
+    # exchanges' own normal quote-level noise, so the gate tripped on 100% of
+    # evaluations and silently killed 62% of ALL signals (1,237 of 2,000). The
+    # gate exists to catch a genuinely misbehaving feed (which shows as 1%+
+    # divergence or staleness, both still caught at 0.5%), not normal
+    # two-venue microstructure noise. Re-simulated against the same 2,000
+    # signals: 0.5% tolerance turns 1 fired signal into ~355 would-fire
+    # opportunities (net-of-fee edge > 4%, entry <= 0.45 cap).
+    CROSS_EXCHANGE_TOLERANCE_PCT: float = 0.5
 
     # --- Fill realism (paper mode) -------------------------------------------
     # Simulates the delay between "we decided to trade" and "the order actually

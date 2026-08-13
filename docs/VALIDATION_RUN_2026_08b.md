@@ -321,6 +321,10 @@ blocked pairs with zero trades).
 
 ---
 
+| 2026-08-13 | **FREEZE OVERRIDE (user-directed: "why the bot become taking very few trades... please make the fixes") — two ENTRY-GATE calibration fixes, measured against the live signal log, not fit to a loss cluster.** The bot was evaluating 8,801 signals/day and firing ~0. Root cause found by pulling the live `/api/signals` + `/api/disagreements` audit rows, not by guessing: **(1) CROSS_EXCHANGE_TOLERANCE_PCT 0.1 → 0.5** — live Binance-vs-Coinbase disagreement on BTC/ETH sits at **0.10–0.133% essentially ALWAYS** (2,000 consecutive observations: min 0.100, max 0.133), so the old 0.1% tolerance was *below the exchanges' own quote-level noise* and tripped on **100%** of evaluations, silently killing **62%** of ALL signals (1,237/2,000). A genuinely misbehaving feed shows 1%+ divergence or staleness — still caught at 0.5%. **(2) MIN_CONFIDENCE 0.75 → 0.70** — live target-ask book depth is median ~$292, and only 49% of would-fire signals clear the $500-equivalent 0.75 bar vs 84.5% clearing 0.70 (depth ≥ ~$200, which still rejects genuinely empty books); freshness protection (decays to 0 by 5s) is unchanged. Re-simulated the same 2,000 signals under the fixed gates: **1 fired → ~355 would-fire** (net-of-fee edge > 4%, entry ≤ 0.45 cap, fee per-share at logged polymarket prob). This is what the gap strategy was missing: the fast-path entry + GAP_EXPIRED exit machinery already exists, but the cross-exchange gate was blocking 6 of 10 signals before any of it could engage. Both are calibration corrections with a measured mechanism, not curve-fits to recent PnL. 478 tests pass (1 updated: tolerance-default assertion). |
+
+---
+
 *Continue logging every intervention below — a run with a documented human
 intervention is still usable; a run with an undocumented one isn't
 trustworthy.*
