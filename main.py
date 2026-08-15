@@ -1074,7 +1074,20 @@ class TradingApp:
         self._dashboard_state.kill_switch_tripped = self.risk.kill_switch_tripped
 
         if not self.risk.is_trading_allowed():
-            return  # halted or kill-switched — evaluate nothing new, just idle
+            # Risk halt (daily halt or kill switch): stop opening NEW
+            # positions, but still MANAGE EXISTING ONES. Verified 2026-08-15
+            # live: the kill switch tripped during the 19:37-19:38 loss
+            # cluster (drawdown crossed the 40%% kill threshold); the early
+            # return below skipped _check_early_exits, so NO_PROGRESS (120s)
+            # never fired on the four never-green positions open at that
+            # moment and all four rode 4+ hours to settlement at $0 — about
+            # -$200 of the -$354 total, losses the exits were built to cut.
+            # The /pause path below already keeps exits running; a risk halt
+            # must not do LESS than pause. Settlement is unaffected (it runs
+            # in its own loop).
+            logger.info("Skipping new entries: reason=risk_halted")
+            await self._check_early_exits(equity)
+            return
 
         if self._trading_paused:
             # /pause: stop opening NEW positions, but still manage existing
@@ -1783,6 +1796,29 @@ class TradingApp:
             level=AlertLevel.WARNING if paused else AlertLevel.INFO,
         )
         return msg
+
+    async def reset_kill_switch(self, note: str = "Telegram /reset") -> str:
+        """
+        Operator-facing kill-switch reset (/reset). The kill switch is the
+        only state that can park the bot with NO way to resume except DB
+        surgery (verified live 2026-08-15: drawdown crossed the 40%%
+        threshold on 08-13, the bot sat parked for ~2 days, and nothing but
+        a manual DB reset could restart it — the risk-free scans never even
+        ran, so the "never fires" answer was unknowable). This keeps the
+        deliberate "requires a human decision" property (the reset is
+        recorded with an operator note and re-seeds the peak-equity
+        baseline) while giving the operator a supported path.
+        """
+        if self.risk is None:
+            return "Risk manager not ready."
+        if not self.risk.kill_switch_tripped:
+            return "Kill switch is not tripped — nothing to reset."
+        await self.risk.manual_reset_kill_switch(note)
+        self._dashboard_state.kill_switch_tripped = False
+        return (
+            "Kill switch RESET — drawdown baseline re-seeded from current equity. "
+            "Trading (and the risk-free scans) will resume next cycle."
+        )
 
     def _get_dashboard_state(self) -> DashboardState:
         return self._dashboard_state

@@ -271,7 +271,7 @@ async def test_run_command_listener_registers_all_commands():
     assert commands == {
         "start", "menu", "status", "stats", "crm", "positions", "trades",
         "risk", "feeds", "config", "latency", "pause", "resume", "mute",
-        "unmute", "alerts", "help",
+        "unmute", "alerts", "reset", "help",
     }
     # The button interface is registered alongside the slash commands.
     from telegram.ext import CallbackQueryHandler, MessageHandler
@@ -549,6 +549,7 @@ class FakeControls:
     def __init__(self):
         self.paused = False
         self.muted = False
+        self.reset_called = False
 
     async def set_paused(self, paused: bool) -> str:
         self.paused = paused
@@ -563,6 +564,10 @@ class FakeControls:
 
     def is_muted(self) -> bool:
         return self.muted
+
+    async def reset_kill_switch(self, note: str) -> str:
+        self.reset_called = True
+        return f"Kill switch RESET ({note})"
 
 
 @pytest.mark.asyncio
@@ -591,6 +596,34 @@ async def test_cmd_mute_unmute_toggle_controls():
 
     await r._cmd_unmute(owner, None)
     assert controls.muted is False
+
+
+@pytest.mark.asyncio
+async def test_cmd_reset_calls_controls():
+    """
+    /reset — the operator-facing kill-switch reset. The kill switch can park
+    the bot with no resume path except DB surgery (live 2026-08-15: drawdown
+    crossed 40% on 08-13 and the bot sat parked ~2 days). The command must
+    reach the controls' reset_kill_switch with an audit note.
+    """
+    controls = FakeControls()
+    r = TelegramReporter(TOKEN, CHAT_ID, status_provider=lambda: SNAPSHOT, controls=controls)
+    owner = FakeUpdate(int(CHAT_ID))
+
+    await r._cmd_reset(owner, None)
+    assert controls.reset_called is True
+    assert "RESET" in owner.effective_chat.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_cmd_reset_gated_to_configured_chat():
+    """A stranger must not be able to clear a tripped kill switch."""
+    controls = FakeControls()
+    r = TelegramReporter(TOKEN, CHAT_ID, status_provider=lambda: SNAPSHOT, controls=controls)
+    stranger = FakeUpdate(999)
+    await r._cmd_reset(stranger, None)
+    assert stranger.effective_chat.sent == []
+    assert controls.reset_called is False
 
 
 @pytest.mark.asyncio

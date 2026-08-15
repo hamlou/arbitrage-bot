@@ -799,6 +799,56 @@ async def test_edge_reversal_respects_min_hold(app_settings):
         await app.db.close()
 
 
+async def test_risk_halt_still_manages_exits(app_settings):
+    """
+    Regression for the 2026-08-15 live finding: the kill switch tripped
+    during the 19:37-19:38 loss cluster (drawdown crossed the 40% threshold)
+    and the whole trading cycle returned BEFORE _check_early_exits — so
+    NO_PROGRESS (120s) never fired on the four never-green positions open at
+    that moment, and all four rode 4+ hours to settlement at $0 (~-$200 of
+    the -$354 total). A risk halt must stop NEW ENTRIES only; open positions
+    are still managed (the /pause path already does this).
+    """
+    app = await build_app(app_settings)
+    try:
+        app.feed_health.record_message("binance")
+        app.feed_health.record_message("polymarket")
+        now = time.time()
+        market = make_market(reference_price=65000)
+        yes_book = make_book(market.token_id_yes, 0.49, 0.51)
+        no_book = make_book(market.token_id_no, 0.49, 0.51)
+        app.feed.register(market, yes_book, no_book)
+        app._known_markets[market.market_id] = market
+
+        fill = await app.broker.place_order(market, "YES", 100)
+        assert fill.avg_price < 0.60
+
+        # Trip the kill switch exactly as the risk manager would (drawdown
+        # breached the threshold on a real loss cluster).
+        app.risk._kill_switch_tripped = True
+        assert app.risk.is_trading_allowed() is False
+
+        # Never-green position: the book never crosses entry, and the trade
+        # is aged past NO_PROGRESS_HOLD_S (120s) — exactly the class that
+        # rode to settlement at $0 on 08-13.
+        underwater = make_book(market.token_id_yes, 0.42, 0.44)
+        app.feed.books[market.token_id_yes] = underwater
+        await app.db._conn.execute(
+            "UPDATE trades SET entry_ts = ? WHERE id = ?",
+            (now - 200, fill.trade_id),
+        )
+
+        # The FULL trading cycle (not just _check_early_exits) must still
+        # cut the position even though entries are halted.
+        await app._trading_cycle()
+
+        closed = [t for t in await app.db.get_all_trades(mode="PAPER") if t["status"] == "CLOSED"]
+        assert len(closed) == 1
+        assert closed[0]["exit_reason"] == "NO_PROGRESS"
+    finally:
+        await app.db.close()
+
+
 async def test_reprice_exit_banks_convergence(app_settings):
     """
     Round-trip protocol (the strategy's high-win-rate piece): a directional

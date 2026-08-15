@@ -491,6 +491,29 @@ class TelegramReporter:
         except Exception:
             logger.exception("Failed to answer /unmute command")
 
+    async def _cmd_reset(self, update, context) -> None:
+        """
+        /reset — operator-facing kill-switch reset. The kill switch can
+        park the bot with no resume path except DB surgery (live 2026-08-15:
+        drawdown crossed 40% on 08-13 and the bot sat parked ~2 days — the
+        risk-free scans never even ran, so the "never fires" question was
+        unanswerable). This gives the operator a supported, audited reset
+        (every reset is logged with an operator note and re-seeds the
+        drawdown baseline).
+        """
+        if not self._authorized(update):
+            return
+        try:
+            if self.controls is None or not hasattr(self.controls, "reset_kill_switch"):
+                await self._send_reply(update, "Reset control not available — no controls wired.")
+                return
+            result = self.controls.reset_kill_switch("Telegram /reset command")
+            if hasattr(result, "__await__"):
+                result = await result
+            await self._send_reply(update, str(result))
+        except Exception:
+            logger.exception("Failed to answer /reset command")
+
     async def _cmd_alerts(self, update, context) -> None:
         """Show current paused/muted state."""
         if not self._authorized(update):
@@ -504,7 +527,7 @@ class TelegramReporter:
             text = (
                 f"Trading: {'PAUSED' if paused else 'active'}\n"
                 f"Alerts: {'MUTED' if muted else 'on'}\n\n"
-                "Commands: /pause /resume /mute /unmute"
+                "Commands: /pause /resume /mute /unmute /reset"
             )
             await self._send_reply(update, text)
         except Exception:
@@ -536,6 +559,7 @@ class TelegramReporter:
                 "<b>Control</b>\n"
                 "/pause — stop opening new trades (positions still managed)\n"
                 "/resume — resume opening new trades\n"
+                "/reset — clear a tripped kill switch (audited, re-seeds drawdown baseline)\n"
                 "/mute — mute routine alerts (CRITICAL always delivered)\n"
                 "/unmute — unmute alerts\n"
                 "/alerts — show paused/muted state\n\n"
@@ -629,6 +653,7 @@ class TelegramReporter:
             ("mute", self._cmd_mute),
             ("unmute", self._cmd_unmute),
             ("alerts", self._cmd_alerts),
+            ("reset", self._cmd_reset),
             ("help", self._cmd_help),
         ]:
             application.add_handler(CommandHandler(name, handler))
